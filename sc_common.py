@@ -48,7 +48,7 @@ def find_unconnected_edge(grupo_arestas, aresta_inicial):
 
         return None  # nenhuma aresta não conectada foi encontrada
     except Exception as e:
-        print("Erro ao buscar aresta não conectada: {e}")
+        print("Erro ao buscar aresta não conectada: {}".format(e))
         return None
 
 # Função para medir distância entre vértices
@@ -200,7 +200,7 @@ def create_loft_from_pasted_edges(pastedResult1, pastedResult2):
         
         return resultBody
     except Exception as e:
-        print("Ocorreu um erro: " .format(e))
+        print("Ocorreu um erro: {}".format(e))
         return None
 
 # Função para combinar dois corpos
@@ -252,7 +252,7 @@ def copy_and_paste_edges(selection):
 
         return result #pastedSelection
     except Exception as e:
-        print("Ocorreu um erro: " .format(e))
+        print("Ocorreu um erro: {}".format(e))
         return None
 
 # Fatiar corpos por plano 
@@ -573,7 +573,7 @@ def sort_by_vertex_share(edges):
             print("Aviso: As arestas não formam um loop fechado.")
         return ordered_edges
     except Exception as e:
-        print("Erro: {str(e)}")
+        print("Erro: {}".format(e))
         return None
     
 # Função para medir distancia minima entre duas faces
@@ -759,7 +759,7 @@ def split_faces(face1, face2):
 
     except Exception as e:
         print("oi")
-        print("Ocorreu um erro ao dividir as faces: ".format(e))
+        print("Ocorreu um erro ao dividir as faces: {}".format(e))
         try:
             return list(result.CreatedFaces)
         except:
@@ -786,7 +786,7 @@ def extract_last_face(body):
         return out_face1, out_face2
 
     except Exception as e:
-        print("Erro inesperado: ".format(e))
+        print("Erro inesperado: {}".format(e))
         return None, None
     
 # Função para encontrar face mais próxima ou mais distante centro de duas faces em relação a outra
