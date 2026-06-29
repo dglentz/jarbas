@@ -82,8 +82,9 @@ try:
     inlist = selection.GetItems[IDocObject]()
     onlist = len(inlist)
 
-    # 2 faces alvo + 8 arestas abertas (4 por extremidade) = 10 itens minimo
-    if onlist >= 10:
+    # Minimo: 2 faces alvo + pelo menos 1 aresta por extremidade = 4 itens
+    # Perfis C com abas quebradas podem ter mais de 4 arestas por extremidade
+    if onlist >= 4:
         try:
             sys.settrace(trace_external_calls)
             _two_side_.main_function(selection)
@@ -91,7 +92,7 @@ try:
             sys.settrace(None)
     else:
         print("Erro: selecione 2 faces alvo e as arestas abertas das 2 extremidades.")
-        print("Itens selecionados: {} | Minimo esperado: 10".format(onlist))
+        print("Itens selecionados: {}".format(onlist))
 
 except Exception as e:
     sys.settrace(None)
