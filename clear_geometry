@@ -1,0 +1,3010 @@
+# Python Script, API Version = V251
+# clean_v01_tree_safe_spaceclaim_v25.py
+# Revisao V01:
+# - Varredura robusta da arvore usando GetAllBodies + fallback recursivo em componentes.
+# - Filtro opcional considera nome do body e caminho/nome dos componentes.
+# - Logging em console + arquivo C:\temp.
+# - Wrappers de Selection/Fill mais tolerantes para API V25.
+# - Assinaturas de falha incluem IDs de faces para nao bloquear regioes parecidas.
+#
+try:
+    import os
+except:
+    os = None
+
+try:
+    from datetime import datetime
+except:
+    datetime = None
+
+SCRIPT_VERSION = "clean_v01_tree_safe_spaceclaim_v25"
+
+
+# ============================================================
+# PIPELINE DE LIMPEZA DE TUBOS / PERFIS
+# SpaceClaim / Discovery API V251
+#
+# Estratégia:
+# 1. Processar somente bodies filtrados por nome.
+# 2. Remover raios pequenos incrementalmente.
+# 3. Limpar arestas/linhas residuais antes dos furos/dentes.
+# 4. Remover recursos pequenos por cadeias conectadas com seed.
+# 5. Remover furos/remanescentes sem seed.
+# 6. Limpeza final de arestas residuais.
+#
+# Compatível com IronPython:
+# - Sem lambda
+# - Sem key=
+# - Sem sorted()
+# - Sem f-string
+# ============================================================
+
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+# Deixe [] para limpar todos os corpos.
+#    "rectangular_tube",
+#   "curved_tube",
+#    "open_profile"
+# Apos o ML, pode usar nomes de classes no body OU no componente/pasta.
+BODY_NAME_FILTERS = [
+   "rectangular_tube",
+   "curved_tube",
+   "open_profile"
+]
+
+# Se True, o filtro acima tambem procura no caminho de componentes/pastas.
+BODY_FILTER_MATCH_COMPONENT_PATH = True
+
+# Se False, ignora corpos ocultos. Para pipeline pos-ML normalmente True e mais previsivel.
+PROCESS_HIDDEN_BODIES = True
+
+# Varredura robusta da arvore.
+ENABLE_TREE_RECURSIVE_FALLBACK = True
+TREE_CRAWL_MAX_DEPTH = 30
+DEBUG_TREE_LOG = True
+
+# Logs em arquivo para auditoria de geometrias grandes.
+LOG_TO_FILE = True
+DEBUG_LOG_DIR = r"C:\temp"
+DEBUG_LOG_PREFIX = "clean_debug_"
+
+
+# -------------------------
+# Logs
+# -------------------------
+
+DEBUG_LOG = True
+DEBUG_FEATURE_LOG = True
+DEBUG_EDGE_LOG = True
+DEBUG_HOLE_LOG = True
+
+DEBUG_MAX_SEEDS_TO_PRINT = 12
+DEBUG_MAX_COMPONENTS_TO_PRINT = 12
+
+
+# -------------------------
+# Raios
+# -------------------------
+
+ENABLE_ROUND_CLEAN = True
+
+MAX_ROUND_RADIUS_MM = 8.0
+ROUND_INCREMENT_MM = 1.0
+ROUND_CLEAN_PASSES = 2
+
+ENABLE_ROUND_INDIVIDUAL_FALLBACK = False
+
+
+# -------------------------
+# Limpeza de arestas residuais
+# -------------------------
+
+ENABLE_PRE_CHAIN_EDGE_CLEAN = False
+ENABLE_FINAL_EDGE_CLEAN = False
+
+RESIDUAL_EDGE_MAX_LENGTH_MM = 20.0
+MAX_RESIDUAL_EDGE_ATTEMPTS = 40
+
+ENABLE_EDGE_DELETE_FALLBACK = False
+
+
+# -------------------------
+# Limpeza por cadeia de faces com seed
+# -------------------------
+
+ENABLE_FEATURE_CHAIN_CLEAN = True
+
+SEED_FACE_MAX_AREA_MM2 = 35.0
+CHAIN_MEMBER_MAX_AREA_MM2 = 2500.0
+
+CHAIN_MAX_FACES = 10
+
+MAX_CHAIN_ATTEMPTS_PER_BODY = 50
+CHAIN_CLEAN_PASSES = 3
+
+ALLOW_SINGLE_FACE_FILL = False
+
+# Manter False reduz popup externo.
+ENABLE_RISKY_FALLBACK_VARIANTS = False
+
+# Nova estratégia para dentes:
+# tenta pares seed + vizinho ordenados por área-alvo.
+ENABLE_DENT_PAIR_SEARCH = True
+DENT_SEED_MAX_AREA_MM2 = 4.0
+DENT_NEIGHBOR_TARGET_AREA_MM2 = 77.0
+DENT_NEIGHBOR_MIN_AREA_MM2 = 40.0
+DENT_NEIGHBOR_MAX_AREA_MM2 = 160.0
+MAX_DENT_PAIR_TRIES = 6
+
+# Fallback controlado para dentes.
+# Se True, após pares falharem tenta uma cadeia parcial pequena.
+ENABLE_DENT_CONTROLLED_FALLBACK = True
+DENT_FALLBACK_MAX_FACES = 3
+
+
+# -------------------------
+# Limpeza de furos/remanescentes sem seed
+# -------------------------
+
+ENABLE_REMAINING_HOLE_CLEAN = True
+
+REMAINING_HOLE_FACE_MAX_AREA_MM2 = 2500.0
+REMAINING_HOLE_MAX_COMPONENT_FACES = 8
+
+ALLOW_SINGLE_FACE_HOLE_FILL = True
+
+REMAINING_HOLE_CLEAN_PASSES = 3
+MAX_REMAINING_HOLE_ATTEMPTS = 30
+
+
+# -------------------------
+# Proteção de faces principais
+# -------------------------
+
+PROTECT_LARGEST_FACES_COUNT = 6
+MIN_PROTECTED_FACE_AREA_MM2 = 100000.0
+
+
+# -------------------------
+# Unidades
+# -------------------------
+
+MM2_TO_M2 = 1.0e-6
+M_TO_MM = 1000.0
+
+
+# ============================================================
+# LOGS / UTILITÁRIOS
+# ============================================================
+
+_DEBUG_LOG_PATH = None
+
+
+def _ensure_debug_log_dir():
+    if not LOG_TO_FILE:
+        return
+
+    try:
+        if os is None:
+            return
+    except:
+        return
+
+    try:
+        if not os.path.exists(DEBUG_LOG_DIR):
+            os.makedirs(DEBUG_LOG_DIR)
+    except:
+        pass
+
+
+def get_debug_log_path():
+    global _DEBUG_LOG_PATH
+
+    if _DEBUG_LOG_PATH is not None:
+        return _DEBUG_LOG_PATH
+
+    try:
+        if datetime is not None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            stamp = "manual"
+    except:
+        stamp = "manual"
+
+    try:
+        if os is not None:
+            _DEBUG_LOG_PATH = os.path.join(DEBUG_LOG_DIR, DEBUG_LOG_PREFIX + stamp + ".txt")
+        else:
+            _DEBUG_LOG_PATH = r"C:\temp\clean_debug.txt"
+    except:
+        _DEBUG_LOG_PATH = r"C:\temp\clean_debug.txt"
+
+    return _DEBUG_LOG_PATH
+
+
+def log(msg):
+    try:
+        line = str(msg)
+    except:
+        line = "<LOG_FORMAT_ERROR>"
+
+    try:
+        print(line)
+    except:
+        pass
+
+    if not LOG_TO_FILE:
+        return
+
+    try:
+        _ensure_debug_log_dir()
+        path = get_debug_log_path()
+        f = open(path, "a")
+        try:
+            f.write(line + "\n")
+        finally:
+            f.close()
+    except:
+        pass
+
+
+def debug_log(msg):
+    if DEBUG_LOG:
+        log(msg)
+
+
+def feature_log(msg):
+    if DEBUG_FEATURE_LOG:
+        log(msg)
+
+
+def edge_log(msg):
+    if DEBUG_EDGE_LOG:
+        log(msg)
+
+
+def hole_log(msg):
+    if DEBUG_HOLE_LOG:
+        log(msg)
+
+
+def tree_log(msg):
+    if DEBUG_TREE_LOG:
+        log(msg)
+
+
+def safe_name(obj):
+    if obj is None:
+        return "None"
+
+    try:
+        return obj.GetName()
+    except:
+        pass
+
+    try:
+        return obj.Name
+    except:
+        pass
+
+    try:
+        return str(obj)
+    except:
+        return "<sem nome>"
+
+
+def safe_type_name(obj):
+    if obj is None:
+        return "None"
+
+    try:
+        return obj.GetType().Name
+    except:
+        pass
+
+    try:
+        return str(type(obj))
+    except:
+        return "UnknownType"
+
+
+def safe_export_id(obj):
+    if obj is None:
+        return "None"
+
+    try:
+        return str(obj.ExportIdentifier)
+    except:
+        pass
+
+    try:
+        return str(obj.GetHashCode())
+    except:
+        pass
+
+    try:
+        return str(id(obj))
+    except:
+        return safe_name(obj)
+
+
+def list_from_iterable(obj):
+    if obj is None:
+        return []
+
+    try:
+        return list(obj)
+    except:
+        pass
+
+    out = []
+
+    try:
+        for item in obj:
+            out.append(item)
+
+        return out
+    except:
+        pass
+
+    try:
+        count = obj.Count
+        count = count() if callable(count) else count
+
+        for i in range(int(count)):
+            try:
+                out.append(obj[i])
+            except:
+                pass
+
+        return out
+    except:
+        pass
+
+    try:
+        length = len(obj)
+
+        for i in range(int(length)):
+            try:
+                out.append(obj[i])
+            except:
+                pass
+
+        return out
+    except:
+        return out
+
+
+def to_float_value(value):
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except:
+        pass
+
+    try:
+        return float(value.Value)
+    except:
+        pass
+
+    try:
+        return float(value.Magnitude)
+    except:
+        pass
+
+    return None
+
+
+def face_is_same(face_a, face_b):
+    try:
+        return face_a == face_b
+    except:
+        return False
+
+
+def edge_is_same(edge_a, edge_b):
+    try:
+        return edge_a == edge_b
+    except:
+        return False
+
+
+def face_is_in_list(face, face_list):
+    if face_list is None:
+        return False
+
+    for i in range(len(face_list)):
+        try:
+            if face_is_same(face, face_list[i]):
+                return True
+        except:
+            pass
+
+    return False
+
+
+def edge_is_in_list(edge, edge_list):
+    if edge_list is None:
+        return False
+
+    for i in range(len(edge_list)):
+        try:
+            if edge_is_same(edge, edge_list[i]):
+                return True
+        except:
+            pass
+
+    return False
+
+
+def append_face_unique(face_list, face):
+    if face_list is None:
+        return
+
+    if face is None:
+        return
+
+    if not face_is_in_list(face, face_list):
+        face_list.append(face)
+
+
+def append_edge_unique(edge_list, edge):
+    if edge_list is None:
+        return
+
+    if edge is None:
+        return
+
+    if not edge_is_in_list(edge, edge_list):
+        edge_list.append(edge)
+
+
+def record_area(record):
+    try:
+        return record["area_mm2"]
+    except:
+        return 0.0
+
+
+def record_face(record):
+    try:
+        return record["face"]
+    except:
+        return None
+
+
+def record_id(record):
+    try:
+        return safe_export_id(record["face"])
+    except:
+        return "no_record_id"
+
+
+def record_is_same(record_a, record_b):
+    if record_a is None:
+        return False
+
+    if record_b is None:
+        return False
+
+    return face_is_same(record_a["face"], record_b["face"])
+
+
+def record_is_in_list(record, record_list):
+    if record is None:
+        return False
+
+    if record_list is None:
+        return False
+
+    for i in range(len(record_list)):
+        if record_is_same(record, record_list[i]):
+            return True
+
+    return False
+
+
+def append_record_unique(record_list, record):
+    if record_list is None:
+        return
+
+    if record is None:
+        return
+
+    if not record_is_in_list(record, record_list):
+        record_list.append(record)
+
+
+# ============================================================
+# ORDENAÇÃO COMPATÍVEL COM IRONPYTHON
+# ============================================================
+
+def sort_records_by_area_ascending(records):
+    if records is None:
+        return []
+
+    records = list_from_iterable(records)
+    n = len(records)
+
+    for i in range(n):
+        min_index = i
+
+        for j in range(i + 1, n):
+            if record_area(records[j]) < record_area(records[min_index]):
+                min_index = j
+
+        if min_index != i:
+            temp = records[i]
+            records[i] = records[min_index]
+            records[min_index] = temp
+
+    return records
+
+
+def sort_records_by_area_descending(records):
+    if records is None:
+        return []
+
+    records = list_from_iterable(records)
+    n = len(records)
+
+    for i in range(n):
+        max_index = i
+
+        for j in range(i + 1, n):
+            if record_area(records[j]) > record_area(records[max_index]):
+                max_index = j
+
+        if max_index != i:
+            temp = records[i]
+            records[i] = records[max_index]
+            records[max_index] = temp
+
+    return records
+
+
+def record_area_distance_to_target(record, target_area):
+    area = record_area(record)
+
+    if area >= target_area:
+        return area - target_area
+
+    return target_area - area
+
+
+def sort_records_by_distance_to_target_area(records, target_area):
+    if records is None:
+        return []
+
+    records = list_from_iterable(records)
+    n = len(records)
+
+    for i in range(n):
+        best_index = i
+
+        for j in range(i + 1, n):
+            d_j = record_area_distance_to_target(records[j], target_area)
+            d_best = record_area_distance_to_target(records[best_index], target_area)
+
+            if d_j < d_best:
+                best_index = j
+
+        if best_index != i:
+            temp = records[i]
+            records[i] = records[best_index]
+            records[best_index] = temp
+
+    return records
+
+
+def component_min_area(component):
+    if component is None:
+        return 0.0
+
+    if len(component) == 0:
+        return 0.0
+
+    min_area = record_area(component[0])
+
+    for i in range(1, len(component)):
+        area = record_area(component[i])
+
+        if area < min_area:
+            min_area = area
+
+    return min_area
+
+
+def component_max_area(component):
+    if component is None:
+        return 0.0
+
+    if len(component) == 0:
+        return 0.0
+
+    max_area = record_area(component[0])
+
+    for i in range(1, len(component)):
+        area = record_area(component[i])
+
+        if area > max_area:
+            max_area = area
+
+    return max_area
+
+
+def component_area_spread(component):
+    return component_max_area(component) - component_min_area(component)
+
+
+def sort_components_by_min_area(components):
+    if components is None:
+        return []
+
+    components = list_from_iterable(components)
+    n = len(components)
+
+    for i in range(n):
+        min_index = i
+
+        for j in range(i + 1, n):
+            if component_min_area(components[j]) < component_min_area(components[min_index]):
+                min_index = j
+
+        if min_index != i:
+            temp = components[i]
+            components[i] = components[min_index]
+            components[min_index] = temp
+
+    return components
+
+
+# ============================================================
+# ROOT / CORPOS
+# ============================================================
+
+def get_root_part_safe():
+    try:
+        return GetRootPart()
+    except Exception as e:
+        log("[ERRO] Não foi possível acessar GetRootPart(): {0}".format(e))
+        return None
+
+
+def object_key_safe(obj):
+    if obj is None:
+        return "None"
+
+    try:
+        return safe_type_name(obj) + "|" + str(obj.ExportIdentifier)
+    except:
+        pass
+
+    try:
+        return safe_type_name(obj) + "|" + str(obj.GetHashCode())
+    except:
+        pass
+
+    try:
+        return safe_type_name(obj) + "|" + str(id(obj))
+    except:
+        return safe_type_name(obj) + "|" + safe_name(obj)
+
+
+def key_is_in_list(key, key_list):
+    if key_list is None:
+        return False
+
+    for i in range(len(key_list)):
+        if key == key_list[i]:
+            return True
+
+    return False
+
+
+def append_unique_body(body_list, body, body_keys):
+    if body is None:
+        return False
+
+    key = object_key_safe(body)
+
+    if key_is_in_list(key, body_keys):
+        return False
+
+    body_list.append(body)
+    body_keys.append(key)
+    return True
+
+
+def looks_like_body(obj):
+    if obj is None:
+        return False
+
+    try:
+        faces = obj.GetFaces()
+        return True
+    except:
+        pass
+
+    try:
+        faces = obj.Faces
+        faces = faces() if callable(faces) else faces
+        return True
+    except:
+        pass
+
+    try:
+        shape = obj.Shape
+        faces = shape.GetFaces()
+        return True
+    except:
+        pass
+
+    return False
+
+
+def get_collection_by_attr_or_method(obj, attr_name):
+    if obj is None:
+        return []
+
+    try:
+        value = getattr(obj, attr_name)
+        value = value() if callable(value) else value
+        return list_from_iterable(value)
+    except:
+        return []
+
+
+def get_content_object(obj):
+    if obj is None:
+        return None
+
+    try:
+        value = obj.Content
+        value = value() if callable(value) else value
+        return value
+    except:
+        return None
+
+
+def collect_direct_bodies_from_container(container):
+    out = []
+
+    if container is None:
+        return out
+
+    candidates = ["GetBodies", "Bodies", "DesignBodies"]
+
+    for i in range(len(candidates)):
+        attr = candidates[i]
+        try:
+            items = get_collection_by_attr_or_method(container, attr)
+
+            for j in range(len(items)):
+                item = items[j]
+
+                if looks_like_body(item):
+                    out.append(item)
+        except:
+            pass
+
+    return out
+
+
+def collect_child_containers(container):
+    out = []
+
+    if container is None:
+        return out
+
+    attrs = [
+        "GetComponents",
+        "Components",
+        "DesignComponents",
+        "SubComponents",
+        "Children",
+        "GetChildren",
+        "Occurrences",
+        "Content"
+    ]
+
+    for i in range(len(attrs)):
+        attr = attrs[i]
+
+        if attr == "Content":
+            content = get_content_object(container)
+
+            if content is not None:
+                out.append(content)
+
+            continue
+
+        try:
+            items = get_collection_by_attr_or_method(container, attr)
+
+            for j in range(len(items)):
+                child = items[j]
+
+                if child is not None:
+                    out.append(child)
+
+                content = get_content_object(child)
+
+                if content is not None:
+                    out.append(content)
+        except:
+            pass
+
+    return out
+
+
+def crawl_bodies_recursive(container, body_list, body_keys, visited_container_keys, depth, path_text):
+    if container is None:
+        return
+
+    if depth > TREE_CRAWL_MAX_DEPTH:
+        tree_log("[TREE] Profundidade maxima atingida em: {0}".format(path_text))
+        return
+
+    container_key = object_key_safe(container)
+
+    if key_is_in_list(container_key, visited_container_keys):
+        return
+
+    visited_container_keys.append(container_key)
+
+    current_name = safe_name(container)
+
+    try:
+        if path_text is None or path_text == "":
+            next_path = current_name
+        else:
+            next_path = path_text + "/" + current_name
+    except:
+        next_path = current_name
+
+    direct_bodies = collect_direct_bodies_from_container(container)
+
+    for i in range(len(direct_bodies)):
+        body = direct_bodies[i]
+        added = append_unique_body(body_list, body, body_keys)
+
+        if added and DEBUG_TREE_LOG:
+            tree_log("[TREE] Body encontrado depth={0} path={1} body={2}".format(
+                depth,
+                next_path,
+                safe_name(body)
+            ))
+
+    children = collect_child_containers(container)
+
+    for i in range(len(children)):
+        child = children[i]
+
+        if child is None:
+            continue
+
+        if looks_like_body(child):
+            added_body = append_unique_body(body_list, child, body_keys)
+
+            if added_body and DEBUG_TREE_LOG:
+                tree_log("[TREE] Body-child encontrado depth={0} path={1} body={2}".format(
+                    depth,
+                    next_path,
+                    safe_name(child)
+                ))
+
+            continue
+
+        crawl_bodies_recursive(
+            child,
+            body_list,
+            body_keys,
+            visited_container_keys,
+            depth + 1,
+            next_path
+        )
+
+
+def get_all_bodies_v25_tree_safe(root):
+    bodies = []
+    body_keys = []
+
+    if root is None:
+        return bodies
+
+    get_all_count = 0
+    recursive_count_before = 0
+
+    try:
+        all_bodies = list_from_iterable(root.GetAllBodies())
+        get_all_count = len(all_bodies)
+
+        for i in range(len(all_bodies)):
+            append_unique_body(bodies, all_bodies[i], body_keys)
+    except Exception as e:
+        tree_log("[TREE] root.GetAllBodies() indisponivel/falhou: {0}".format(e))
+
+    recursive_count_before = len(bodies)
+
+    if ENABLE_TREE_RECURSIVE_FALLBACK:
+        try:
+            visited_container_keys = []
+            crawl_bodies_recursive(
+                root,
+                bodies,
+                body_keys,
+                visited_container_keys,
+                0,
+                "ROOT"
+            )
+        except Exception as e:
+            tree_log("[TREE] fallback recursivo falhou: {0}".format(e))
+
+    if len(bodies) == 0:
+        try:
+            root_bodies = list_from_iterable(root.GetBodies())
+
+            for i in range(len(root_bodies)):
+                append_unique_body(bodies, root_bodies[i], body_keys)
+        except Exception as e:
+            log("[WARN] root.GetBodies() fallback final falhou: {0}".format(e))
+
+    tree_log("[TREE] GetAllBodies={0} | antes_recursivo={1} | total_unicos={2}".format(
+        get_all_count,
+        recursive_count_before,
+        len(bodies)
+    ))
+
+    return bodies
+
+
+def get_root_bodies():
+    root = get_root_part_safe()
+
+    if root is None:
+        return []
+
+    return get_all_bodies_v25_tree_safe(root)
+
+
+def body_is_visible(body):
+    if body is None:
+        return False
+
+    try:
+        return bool(ViewHelper.GetObjectVisibility(body))
+    except:
+        return True
+
+
+def body_is_alive_light(body):
+    if body is None:
+        return False
+
+    try:
+        faces = get_faces_from_body(body)
+        return len(faces) > 0
+    except:
+        return False
+
+
+def get_parent_candidate(obj):
+    if obj is None:
+        return None
+
+    attrs = ["Parent", "Component", "Owner", "Container"]
+
+    for i in range(len(attrs)):
+        attr = attrs[i]
+
+        try:
+            parent = getattr(obj, attr)
+            parent = parent() if callable(parent) else parent
+
+            if parent is not None:
+                return parent
+        except:
+            pass
+
+    return None
+
+
+def body_parent_path_text(body):
+    names = []
+
+    current = body
+    visited = []
+    depth = 0
+
+    while current is not None and depth < TREE_CRAWL_MAX_DEPTH:
+        key = object_key_safe(current)
+
+        if key_is_in_list(key, visited):
+            break
+
+        visited.append(key)
+
+        try:
+            nm = safe_name(current)
+
+            if nm is not None and nm != "" and nm != "None":
+                names.append(nm)
+        except:
+            pass
+
+        current = get_parent_candidate(current)
+        depth = depth + 1
+
+    text = ""
+
+    # inverte sem sorted/reversed para manter compatibilidade
+    for i in range(len(names) - 1, -1, -1):
+        if text == "":
+            text = names[i]
+        else:
+            text = text + "/" + names[i]
+
+    return text
+
+
+def body_filter_search_text(body):
+    text = ""
+
+    try:
+        text = text + " " + safe_name(body)
+    except:
+        pass
+
+    if BODY_FILTER_MATCH_COMPONENT_PATH:
+        try:
+            text = text + " " + body_parent_path_text(body)
+        except:
+            pass
+
+    try:
+        master = body.Master
+        text = text + " " + safe_name(master)
+    except:
+        pass
+
+    return text.upper()
+
+
+def body_passes_name_filter(body):
+    if BODY_NAME_FILTERS is None:
+        return True
+
+    if len(BODY_NAME_FILTERS) == 0:
+        return True
+
+    text = body_filter_search_text(body)
+
+    for i in range(len(BODY_NAME_FILTERS)):
+        token = BODY_NAME_FILTERS[i]
+
+        try:
+            if token is None:
+                continue
+
+            if str(token).upper() in text:
+                return True
+        except:
+            pass
+
+    return False
+
+
+# SELECTION
+# ============================================================
+
+def empty_selection_safe():
+    try:
+        return Selection.Empty()
+    except:
+        pass
+
+    try:
+        return Selection.Create([])
+    except:
+        pass
+
+    try:
+        return Selection()
+    except:
+        return None
+
+
+def make_selection_safe(items):
+    if items is None:
+        return empty_selection_safe()
+
+    # Item unico.
+    try:
+        if not isinstance(items, list):
+            return Selection.Create(items)
+    except:
+        pass
+
+    seq = list_from_iterable(items)
+
+    if len(seq) == 0:
+        return empty_selection_safe()
+
+    if len(seq) == 1:
+        try:
+            return Selection.Create(seq[0])
+        except:
+            pass
+
+    # No v25, algumas chamadas aceitam lista Python; outras aceitam *args.
+    try:
+        return Selection.Create(seq)
+    except:
+        pass
+
+    try:
+        return Selection.Create(*seq)
+    except:
+        pass
+
+    try:
+        return Selection.Create(items)
+    except Exception as e:
+        debug_log("[WARN] make_selection_safe falhou: {0}".format(e))
+
+    return empty_selection_safe()
+
+
+def create_body_selection(body):
+    if body is None:
+        return empty_selection_safe()
+
+    selection = make_selection_safe(body)
+
+    if selection is None:
+        log("[FAIL] Não foi possível criar seleção do corpo '{0}'".format(
+            safe_name(body)
+        ))
+
+    return selection
+
+
+def create_selection_from_faces(faces):
+    if faces is None:
+        return empty_selection_safe()
+
+    faces = list_from_iterable(faces)
+
+    if len(faces) == 0:
+        return empty_selection_safe()
+
+    selection = make_selection_safe(faces)
+
+    if selection is None:
+        debug_log("[WARN] Selection de faces retornou None com {0} faces".format(len(faces)))
+        return empty_selection_safe()
+
+    return selection
+
+
+def create_selection_from_edges(edges):
+    if edges is None:
+        return empty_selection_safe()
+
+    edges = list_from_iterable(edges)
+
+    if len(edges) == 0:
+        return empty_selection_safe()
+
+    selection = make_selection_safe(edges)
+
+    if selection is None:
+        edge_log("[WARN] Selection de edges retornou None com {0} edges".format(len(edges)))
+        return empty_selection_safe()
+
+    return selection
+
+
+def selection_count(selection):
+    if selection is None:
+        return 0
+
+    candidate_attrs = ["Count", "Length"]
+
+    for i in range(len(candidate_attrs)):
+        attr = candidate_attrs[i]
+
+        try:
+            value = getattr(selection, attr)
+            value = value() if callable(value) else value
+            return int(value)
+        except:
+            pass
+
+    try:
+        return len(list(selection))
+    except:
+        pass
+
+    try:
+        items = selection.Items
+        items = items() if callable(items) else items
+        items = list_from_iterable(items)
+        return len(items)
+    except:
+        pass
+
+    return None
+
+
+def get_items_from_selection(selection):
+    if selection is None:
+        return []
+
+    try:
+        return list(selection)
+    except:
+        pass
+
+    try:
+        items = selection.Items
+        items = items() if callable(items) else items
+        return list_from_iterable(items)
+    except:
+        pass
+
+    return []
+
+
+# ============================================================
+# FACES / ÁREAS
+# ============================================================
+
+def get_faces_from_body(body):
+    if body is None:
+        return []
+
+    try:
+        faces = body.GetFaces()
+        faces = list_from_iterable(faces)
+
+        if len(faces) > 0:
+            return faces
+    except:
+        pass
+
+    try:
+        faces = body.Faces
+        faces = faces() if callable(faces) else faces
+        faces = list_from_iterable(faces)
+
+        if len(faces) > 0:
+            return faces
+    except:
+        pass
+
+    try:
+        shape = body.Shape
+        faces = shape.GetFaces()
+        faces = list_from_iterable(faces)
+
+        if len(faces) > 0:
+            return faces
+    except:
+        pass
+
+    try:
+        shape = body.Shape
+        faces = shape.Faces
+        faces = faces() if callable(faces) else faces
+        faces = list_from_iterable(faces)
+
+        if len(faces) > 0:
+            return faces
+    except:
+        pass
+
+    return []
+
+
+def get_body_face_count(body):
+    try:
+        return len(get_faces_from_body(body))
+    except:
+        return None
+
+
+def get_face_area_m2(face):
+    if face is None:
+        return None
+
+    candidate_attrs = ["Area", "GetArea", "SurfaceArea", "GetSurfaceArea"]
+
+    for i in range(len(candidate_attrs)):
+        attr = candidate_attrs[i]
+
+        try:
+            value = getattr(face, attr)
+            value = value() if callable(value) else value
+            value = to_float_value(value)
+
+            if value is not None:
+                return value
+        except:
+            pass
+
+    try:
+        shape = face.Shape
+
+        for i in range(len(candidate_attrs)):
+            attr = candidate_attrs[i]
+
+            try:
+                value = getattr(shape, attr)
+                value = value() if callable(value) else value
+                value = to_float_value(value)
+
+                if value is not None:
+                    return value
+            except:
+                pass
+    except:
+        pass
+
+    return None
+
+
+def get_face_area_mm2(face):
+    area_m2 = get_face_area_m2(face)
+
+    if area_m2 is None:
+        return None
+
+    try:
+        return area_m2 / MM2_TO_M2
+    except:
+        return None
+
+
+def collect_face_area_records(body):
+    records = []
+    faces = get_faces_from_body(body)
+
+    for i in range(len(faces)):
+        face = faces[i]
+        area_mm2 = get_face_area_mm2(face)
+
+        if area_mm2 is None:
+            continue
+
+        record = {
+            "face": face,
+            "area_mm2": area_mm2
+        }
+
+        records.append(record)
+
+    records = sort_records_by_area_ascending(records)
+    return records
+
+
+# ============================================================
+# EDGES / CONECTIVIDADE
+# ============================================================
+
+def get_edges_from_face(face):
+    if face is None:
+        return []
+
+    try:
+        edges = face.GetEdges()
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    try:
+        edges = face.Edges
+        edges = edges() if callable(edges) else edges
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    try:
+        shape = face.Shape
+        edges = shape.GetEdges()
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    try:
+        shape = face.Shape
+        edges = shape.Edges
+        edges = edges() if callable(edges) else edges
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    return []
+
+
+def get_edges_from_body(body):
+    if body is None:
+        return []
+
+    try:
+        edges = body.GetEdges()
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    try:
+        edges = body.Edges
+        edges = edges() if callable(edges) else edges
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    try:
+        shape = body.Shape
+        edges = shape.GetEdges()
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    try:
+        shape = body.Shape
+        edges = shape.Edges
+        edges = edges() if callable(edges) else edges
+        return list_from_iterable(edges)
+    except:
+        pass
+
+    return []
+
+
+def get_faces_from_edge(edge):
+    if edge is None:
+        return []
+
+    try:
+        faces = edge.GetFaces()
+        return list_from_iterable(faces)
+    except:
+        pass
+
+    try:
+        faces = edge.Faces
+        faces = faces() if callable(faces) else faces
+        return list_from_iterable(faces)
+    except:
+        pass
+
+    try:
+        shape = edge.Shape
+        faces = shape.GetFaces()
+        return list_from_iterable(faces)
+    except:
+        pass
+
+    try:
+        shape = edge.Shape
+        faces = shape.Faces
+        faces = faces() if callable(faces) else faces
+        return list_from_iterable(faces)
+    except:
+        pass
+
+    return []
+
+
+def get_edge_length_m(edge):
+    if edge is None:
+        return None
+
+    candidate_attrs = ["Length", "GetLength"]
+
+    for i in range(len(candidate_attrs)):
+        attr = candidate_attrs[i]
+
+        try:
+            value = getattr(edge, attr)
+            value = value() if callable(value) else value
+            value = to_float_value(value)
+
+            if value is not None:
+                return value
+        except:
+            pass
+
+    try:
+        shape = edge.Shape
+
+        for i in range(len(candidate_attrs)):
+            attr = candidate_attrs[i]
+
+            try:
+                value = getattr(shape, attr)
+                value = value() if callable(value) else value
+                value = to_float_value(value)
+
+                if value is not None:
+                    return value
+            except:
+                pass
+    except:
+        pass
+
+    return None
+
+
+def get_edge_length_mm(edge):
+    length_m = get_edge_length_m(edge)
+
+    if length_m is None:
+        return None
+
+    try:
+        return length_m * M_TO_MM
+    except:
+        return None
+
+
+def find_record_by_face(records, face):
+    if records is None:
+        return None
+
+    for i in range(len(records)):
+        rec = records[i]
+
+        if face_is_same(rec["face"], face):
+            return rec
+
+    return None
+
+
+def get_neighbor_records(face, candidate_records):
+    neighbors = []
+
+    edges = get_edges_from_face(face)
+
+    for i in range(len(edges)):
+        edge = edges[i]
+        edge_faces = get_faces_from_edge(edge)
+
+        for j in range(len(edge_faces)):
+            other_face = edge_faces[j]
+
+            if face_is_same(other_face, face):
+                continue
+
+            rec = find_record_by_face(candidate_records, other_face)
+
+            if rec is not None:
+                append_record_unique(neighbors, rec)
+
+    return neighbors
+
+
+def build_chain_from_seed(seed_record, candidate_records, max_faces):
+    chain = []
+    queue = []
+
+    append_record_unique(chain, seed_record)
+    append_record_unique(queue, seed_record)
+
+    while len(queue) > 0:
+        current = queue[0]
+        del queue[0]
+
+        current_face = current["face"]
+        neighbors = get_neighbor_records(current_face, candidate_records)
+
+        for i in range(len(neighbors)):
+            neighbor = neighbors[i]
+
+            if not record_is_in_list(neighbor, chain):
+                append_record_unique(chain, neighbor)
+                append_record_unique(queue, neighbor)
+
+                if len(chain) >= max_faces:
+                    return chain
+
+    return chain
+
+
+def record_is_in_component(record, component):
+    if record is None:
+        return False
+
+    if component is None:
+        return False
+
+    for i in range(len(component)):
+        if record_is_same(record, component[i]):
+            return True
+
+    return False
+
+
+def record_is_in_components(record, components):
+    if components is None:
+        return False
+
+    for i in range(len(components)):
+        if record_is_in_component(record, components[i]):
+            return True
+
+    return False
+
+
+def build_connected_components(candidate_records, max_faces):
+    components = []
+
+    if candidate_records is None:
+        return components
+
+    for i in range(len(candidate_records)):
+        rec = candidate_records[i]
+
+        if record_is_in_components(rec, components):
+            continue
+
+        comp = build_chain_from_seed(rec, candidate_records, max_faces)
+
+        if len(comp) > 0:
+            components.append(comp)
+
+    components = sort_components_by_min_area(components)
+    return components
+
+
+# ============================================================
+# PROTEÇÃO / CANDIDATOS
+# ============================================================
+
+def get_protected_faces(body):
+    records = collect_face_area_records(body)
+
+    if len(records) == 0:
+        return []
+
+    protected = []
+    records_desc = sort_records_by_area_descending(records)
+
+    for i in range(len(records_desc)):
+        if i < PROTECT_LARGEST_FACES_COUNT:
+            append_face_unique(protected, records_desc[i]["face"])
+
+    for i in range(len(records)):
+        rec = records[i]
+
+        if rec["area_mm2"] >= MIN_PROTECTED_FACE_AREA_MM2:
+            append_face_unique(protected, rec["face"])
+
+    return protected
+
+
+def collect_seed_records(body, protected):
+    records = collect_face_area_records(body)
+    seeds = []
+
+    for i in range(len(records)):
+        rec = records[i]
+        face = rec["face"]
+        area = rec["area_mm2"]
+
+        if area > SEED_FACE_MAX_AREA_MM2:
+            continue
+
+        if face_is_in_list(face, protected):
+            continue
+
+        append_record_unique(seeds, rec)
+
+    seeds = sort_records_by_area_ascending(seeds)
+    return seeds
+
+
+def collect_chain_member_records(body, protected):
+    records = collect_face_area_records(body)
+    candidates = []
+
+    for i in range(len(records)):
+        rec = records[i]
+        face = rec["face"]
+        area = rec["area_mm2"]
+
+        if area > CHAIN_MEMBER_MAX_AREA_MM2:
+            continue
+
+        if face_is_in_list(face, protected):
+            continue
+
+        append_record_unique(candidates, rec)
+
+    candidates = sort_records_by_area_ascending(candidates)
+    return candidates
+
+
+def collect_remaining_hole_records(body, protected):
+    records = collect_face_area_records(body)
+    candidates = []
+
+    for i in range(len(records)):
+        rec = records[i]
+        face = rec["face"]
+        area = rec["area_mm2"]
+
+        if area > REMAINING_HOLE_FACE_MAX_AREA_MM2:
+            continue
+
+        if face_is_in_list(face, protected):
+            continue
+
+        append_record_unique(candidates, rec)
+
+    candidates = sort_records_by_area_ascending(candidates)
+    return candidates
+
+
+def print_seed_summary(seeds, member_records, protected):
+    feature_log("[DEBUG] seeds={0}, membros_cadeia={1}, protegidas={2}".format(
+        len(seeds),
+        len(member_records),
+        len(protected)
+    ))
+
+    max_print = DEBUG_MAX_SEEDS_TO_PRINT
+
+    for i in range(len(seeds)):
+        if i >= max_print:
+            feature_log("[DEBUG] ... sementes adicionais omitidas.")
+            break
+
+        feature_log("[DEBUG] Seed {0}: area={1:.3f} mm2".format(
+            i + 1,
+            seeds[i]["area_mm2"]
+        ))
+
+
+def records_to_faces(records):
+    faces = []
+
+    if records is None:
+        return faces
+
+    for i in range(len(records)):
+        faces.append(records[i]["face"])
+
+    return faces
+
+
+def first_n_records(records, n):
+    out = []
+
+    if records is None:
+        return out
+
+    for i in range(len(records)):
+        if len(out) >= n:
+            break
+
+        out.append(records[i])
+
+    return out
+
+
+def chain_signature(chain):
+    if chain is None:
+        return "empty"
+
+    ids = ""
+    max_ids = 6
+
+    try:
+        for i in range(len(chain)):
+            if i >= max_ids:
+                break
+
+            if ids == "":
+                ids = record_id(chain[i])
+            else:
+                ids = ids + "," + record_id(chain[i])
+    except:
+        ids = "ids_error"
+
+    return "{0}|{1:.3f}|{2:.3f}|{3}".format(
+        len(chain),
+        component_min_area(chain),
+        component_max_area(chain),
+        ids
+    )
+
+
+def signature_in_list(signature, signature_list):
+    if signature_list is None:
+        return False
+
+    for i in range(len(signature_list)):
+        if signature == signature_list[i]:
+            return True
+
+    return False
+
+
+# ============================================================
+# FILL / DELETE
+# ============================================================
+
+def execute_fill_command_safe(selection):
+    errors = []
+
+    try:
+        return Fill.Execute(
+            selection,
+            empty_selection_safe(),
+            FillOptions(),
+            FillMode.ThreeD
+        )
+    except Exception as e:
+        errors.append("Fill.Execute(sel, empty, options, ThreeD): " + str(e))
+
+    try:
+        return Fill.Execute(
+            selection,
+            Selection(),
+            FillOptions(),
+            FillMode.ThreeD
+        )
+    except Exception as e:
+        errors.append("Fill.Execute(sel, Selection(), options, ThreeD): " + str(e))
+
+    try:
+        return Fill.Execute(selection)
+    except Exception as e:
+        errors.append("Fill.Execute(sel): " + str(e))
+
+    raise Exception("Fill falhou em todas as assinaturas: " + " | ".join(errors))
+
+
+def execute_fill(selection, description, body):
+    if selection is None:
+        debug_log("[SKIP] Selection None: {0}".format(description))
+        return False
+
+    count = selection_count(selection)
+
+    if count == 0:
+        debug_log("[SKIP] Seleção vazia: {0}".format(description))
+        return False
+
+    if body is not None and not body_is_alive_light(body):
+        debug_log("[SKIP] Corpo invalido antes do Fill: {0} | {1}".format(
+            safe_name(body),
+            description
+        ))
+        return False
+
+    faces_before = get_body_face_count(body)
+
+    try:
+        result = execute_fill_command_safe(selection)
+    except Exception as e:
+        log("[FAIL] Fill exception em '{0}': {1}".format(description, e))
+        return False
+
+    faces_after = None
+
+    try:
+        faces_after = get_body_face_count(body)
+    except Exception as e:
+        log("[WARN] Não foi possível contar faces após Fill em '{0}': {1}".format(
+            description,
+            e
+        ))
+
+    result_success = True
+
+    try:
+        result_success = bool(result.Success)
+    except:
+        result_success = True
+
+    if faces_before is not None and faces_after is not None:
+        if faces_after < faces_before:
+            log("[OK] Fill removeu faces: {0} | itens={1} | faces {2} -> {3}".format(
+                description,
+                count,
+                faces_before,
+                faces_after
+            ))
+            return True
+
+        if result_success and faces_after != faces_before:
+            log("[OK] Fill alterou topologia: {0} | itens={1} | faces {2} -> {3}".format(
+                description,
+                count,
+                faces_before,
+                faces_after
+            ))
+            return True
+
+        log("[WARN] Fill sem redução: {0} | itens={1} | faces {2} -> {3}".format(
+            description,
+            count,
+            faces_before,
+            faces_after
+        ))
+        return False
+
+    if result_success:
+        log("[OK] Fill executado sem verificação topológica: {0} | itens={1}".format(
+            description,
+            count
+        ))
+        return True
+
+    log("[WARN] Fill retornou sem sucesso explícito: {0} | itens={1}".format(
+        description,
+        count
+    ))
+    return False
+
+
+def execute_delete(selection, description):
+    if selection is None:
+        return False
+
+    count = selection_count(selection)
+
+    if count == 0:
+        return False
+
+    try:
+        result = Delete.Execute(selection)
+        log("[OK] Delete executado: {0} | itens={1}".format(description, count))
+        return True
+    except Exception as e:
+        log("[FAIL] Delete exception em '{0}': {1}".format(description, e))
+        return False
+
+
+def try_fill_records(records, description, body, allow_single):
+    if records is None:
+        return False
+
+    if len(records) == 0:
+        return False
+
+    if len(records) == 1 and not allow_single:
+        return False
+
+    faces = records_to_faces(records)
+
+    try:
+        selection = create_selection_from_faces(faces)
+    except Exception as e:
+        log("[FAIL] Erro criando seleção para '{0}': {1}".format(description, e))
+        return False
+
+    try:
+        return execute_fill(selection, description, body)
+    except Exception as e:
+        log("[FAIL] Erro inesperado em Fill para '{0}': {1}".format(description, e))
+        return False
+
+
+def try_fill_edges(edges, description, body):
+    if edges is None:
+        return False
+
+    if len(edges) == 0:
+        return False
+
+    try:
+        selection = create_selection_from_edges(edges)
+    except Exception as e:
+        edge_log("[FAIL] Erro criando seleção de edges para '{0}': {1}".format(
+            description,
+            e
+        ))
+        return False
+
+    try:
+        return execute_fill(selection, description, body)
+    except Exception as e:
+        edge_log("[FAIL] Erro inesperado em Fill de edge para '{0}': {1}".format(
+            description,
+            e
+        ))
+        return False
+
+
+# ============================================================
+# LIMPEZA DE RAIOS
+# ============================================================
+
+def get_round_selection_by_radius(body, radius_mm):
+    try:
+        body_selection = create_body_selection(body)
+
+        return PowerSelection.Faces.ByRoundRadius(
+            MM(radius_mm),
+            PowerSelectOptions(False, body_selection),
+            SearchCriteria.SizeComparison.SmallerOrEqual,
+            SearchCriteria.RoundType.All
+        )
+
+    except Exception as e:
+        log("[FAIL] ByRoundRadius falhou em '{0}' para raio <= {1} mm: {2}".format(
+            safe_name(body),
+            radius_mm,
+            e
+        ))
+        return None
+
+
+def clean_rounds_at_radius(body, radius_mm):
+    selection = get_round_selection_by_radius(body, radius_mm)
+
+    ok = execute_fill(
+        selection,
+        "raios <= {0} mm em {1}".format(radius_mm, safe_name(body)),
+        body
+    )
+
+    if ok:
+        return True
+
+    if not ENABLE_ROUND_INDIVIDUAL_FALLBACK:
+        return False
+
+    round_faces = get_items_from_selection(selection)
+
+    if len(round_faces) == 0:
+        return False
+
+    removed_any = False
+
+    for i in range(len(round_faces)):
+        temp_records = []
+        temp_records.append({
+            "face": round_faces[i],
+            "area_mm2": 0.0
+        })
+
+        ok_face = try_fill_records(
+            temp_records,
+            "raio individual <= {0} mm | face {1}/{2}".format(
+                radius_mm,
+                i + 1,
+                len(round_faces)
+            ),
+            body,
+            True
+        )
+
+        if ok_face:
+            removed_any = True
+
+    return removed_any
+
+
+def clean_rounds_incremental(body):
+    if body is None:
+        return False
+
+    removed_global = False
+
+    for round_pass in range(ROUND_CLEAN_PASSES):
+        log("")
+        log("[ROUND PASS] Corpo '{0}' | volta {1}/{2}".format(
+            safe_name(body),
+            round_pass + 1,
+            ROUND_CLEAN_PASSES
+        ))
+
+        removed_this_pass = False
+        radius_mm = ROUND_INCREMENT_MM
+
+        while radius_mm <= MAX_ROUND_RADIUS_MM + 1.0e-9:
+            log("[ROUND STEP] Tentando remover raios <= {0} mm".format(radius_mm))
+
+            ok = clean_rounds_at_radius(body, radius_mm)
+
+            if ok:
+                removed_this_pass = True
+                removed_global = True
+
+            radius_mm = radius_mm + ROUND_INCREMENT_MM
+
+        if not removed_this_pass:
+            log("[ROUND PASS] Nenhum raio removido nesta volta. Encerrando etapa de raios.")
+            break
+
+    return removed_global
+
+
+# ============================================================
+# LIMPEZA DE ARESTAS RESIDUAIS
+# ============================================================
+
+def collect_residual_edge_candidates(body):
+    edges = get_edges_from_body(body)
+    candidates = []
+
+    for i in range(len(edges)):
+        edge = edges[i]
+
+        edge_faces = get_faces_from_edge(edge)
+
+        if len(edge_faces) < 2:
+            continue
+
+        length_mm = get_edge_length_mm(edge)
+
+        if length_mm is None:
+            continue
+
+        if length_mm > RESIDUAL_EDGE_MAX_LENGTH_MM:
+            continue
+
+        append_edge_unique(candidates, edge)
+
+    return candidates
+
+
+def find_shortest_edge_not_failed(edges, failed_edges):
+    if edges is None:
+        return None
+
+    best_edge = None
+    best_len = None
+
+    for i in range(len(edges)):
+        edge = edges[i]
+
+        if edge_is_in_list(edge, failed_edges):
+            continue
+
+        length_mm = get_edge_length_mm(edge)
+
+        if length_mm is None:
+            continue
+
+        if best_edge is None:
+            best_edge = edge
+            best_len = length_mm
+            continue
+
+        if length_mm < best_len:
+            best_edge = edge
+            best_len = length_mm
+
+    return best_edge
+
+
+def clean_residual_edges(body, stage_name):
+    log("")
+    log("------------------------------------------------------------")
+    log("[{0}] Limpeza de arestas/linhas residuais".format(stage_name))
+    log("------------------------------------------------------------")
+
+    removed_any = False
+    attempts = 0
+    failed_edges = []
+
+    while attempts < MAX_RESIDUAL_EDGE_ATTEMPTS:
+        candidates = collect_residual_edge_candidates(body)
+
+        edge_log("[EDGE] Arestas candidatas: {0}, falhadas={1}".format(
+            len(candidates),
+            len(failed_edges)
+        ))
+
+        if len(candidates) == 0:
+            break
+
+        edge = find_shortest_edge_not_failed(candidates, failed_edges)
+
+        if edge is None:
+            edge_log("[EDGE] Nenhuma aresta candidata restante após filtrar falhas.")
+            break
+
+        length_mm = get_edge_length_mm(edge)
+
+        if length_mm is None:
+            append_edge_unique(failed_edges, edge)
+            continue
+
+        attempts = attempts + 1
+
+        desc = "aresta residual | stage={0}, tentativa={1}, length={2:.3f} mm em {3}".format(
+            stage_name,
+            attempts,
+            length_mm,
+            safe_name(body)
+        )
+
+        faces_before = get_body_face_count(body)
+
+        ok_fill = try_fill_edges([edge], desc, body)
+
+        faces_after = get_body_face_count(body)
+
+        if ok_fill:
+            removed_any = True
+            failed_edges = []
+
+            log("[EDGE] Aresta residual tratada. Faces {0} -> {1}".format(
+                faces_before,
+                faces_after
+            ))
+
+            continue
+
+        append_edge_unique(failed_edges, edge)
+
+        if ENABLE_EDGE_DELETE_FALLBACK:
+            selection = create_selection_from_edges([edge])
+            ok_delete = execute_delete(selection, desc + " | Delete fallback")
+
+            if ok_delete:
+                removed_any = True
+                failed_edges = []
+                continue
+
+    return removed_any
+
+
+# ============================================================
+# LIMPEZA POR CADEIA COM SEED
+# ============================================================
+
+def filter_records_that_are_in_chain(records, chain):
+    out = []
+
+    if records is None:
+        return out
+
+    for i in range(len(records)):
+        rec = records[i]
+
+        if record_is_in_list(rec, chain):
+            append_record_unique(out, rec)
+
+    return out
+
+
+def try_dent_seed_neighbor_pairs(seed_record, chain, member_records, body, description_prefix):
+    if not ENABLE_DENT_PAIR_SEARCH:
+        return False
+
+    if seed_record is None:
+        return False
+
+    if chain is None:
+        return False
+
+    seed_area = record_area(seed_record)
+
+    if seed_area > DENT_SEED_MAX_AREA_MM2:
+        return False
+
+    neighbors = get_neighbor_records(seed_record["face"], member_records)
+    neighbors = filter_records_that_are_in_chain(neighbors, chain)
+
+    filtered = []
+
+    for i in range(len(neighbors)):
+        area = record_area(neighbors[i])
+
+        if area < DENT_NEIGHBOR_MIN_AREA_MM2:
+            continue
+
+        if area > DENT_NEIGHBOR_MAX_AREA_MM2:
+            continue
+
+        append_record_unique(filtered, neighbors[i])
+
+    filtered = sort_records_by_distance_to_target_area(
+        filtered,
+        DENT_NEIGHBOR_TARGET_AREA_MM2
+    )
+
+    feature_log("[DENT] seed_area={0:.3f}, vizinhos_filtrados={1}".format(
+        seed_area,
+        len(filtered)
+    ))
+
+    tries = 0
+
+    for i in range(len(filtered)):
+        if tries >= MAX_DENT_PAIR_TRIES:
+            break
+
+        neighbor = filtered[i]
+        pair = []
+        pair.append(seed_record)
+        pair.append(neighbor)
+
+        tries = tries + 1
+
+        ok_pair = try_fill_records(
+            pair,
+            "{0} | par dente seed+vizinho | seed={1:.3f}, vizinho={2:.3f}".format(
+                description_prefix,
+                seed_area,
+                record_area(neighbor)
+            ),
+            body,
+            False
+        )
+
+        if ok_pair:
+            return True
+
+    if ENABLE_DENT_CONTROLLED_FALLBACK:
+        fallback = first_n_records(chain, DENT_FALLBACK_MAX_FACES)
+
+        if len(fallback) > 1:
+            ok_fallback = try_fill_records(
+                fallback,
+                "{0} | fallback dente {1} faces | area_min={2:.3f}, area_max={3:.3f}".format(
+                    description_prefix,
+                    len(fallback),
+                    component_min_area(fallback),
+                    component_max_area(fallback)
+                ),
+                body,
+                False
+            )
+
+            if ok_fallback:
+                return True
+
+    return False
+
+
+def select_preferred_chain_variant(chain):
+    if chain is None:
+        return []
+
+    chain_size = len(chain)
+
+    if chain_size == 0:
+        return []
+
+    if chain_size == 1:
+        if ALLOW_SINGLE_FACE_FILL:
+            return first_n_records(chain, 1)
+        return []
+
+    min_area = component_min_area(chain)
+    max_area = component_max_area(chain)
+    spread = component_area_spread(chain)
+
+    # Para dentes com microface, a seleção será tratada por try_dent_seed_neighbor_pairs.
+    if min_area <= DENT_SEED_MAX_AREA_MM2 and max_area >= DENT_NEIGHBOR_MIN_AREA_MM2:
+        return []
+
+    if chain_size == 4:
+        return first_n_records(chain, 3)
+
+    if chain_size >= 5 and spread <= 1.0:
+        return chain
+
+    return chain
+
+
+def try_chain_preferred_variant(seed_record, chain, member_records, body):
+    if chain is None:
+        return False
+
+    chain_size = len(chain)
+
+    if chain_size == 0:
+        return False
+
+    area_min = component_min_area(chain)
+    area_max = component_max_area(chain)
+
+    feature_log("[CHAIN] Cadeia candidata: faces={0}, area_min={1:.3f}, area_max={2:.3f}".format(
+        chain_size,
+        area_min,
+        area_max
+    ))
+
+    # Nova prioridade para dentes:
+    # tenta seed + vizinho com área mais próxima de ~77 mm².
+    ok_dent = try_dent_seed_neighbor_pairs(
+        seed_record,
+        chain,
+        member_records,
+        body,
+        "cadeia dente"
+    )
+
+    if ok_dent:
+        return True
+
+    preferred = select_preferred_chain_variant(chain)
+
+    if preferred is None:
+        return False
+
+    if len(preferred) == 0:
+        return False
+
+    ok_preferred = try_fill_records(
+        preferred,
+        "cadeia preferencial | faces={0}, area_min={1:.3f}, area_max={2:.3f}".format(
+            len(preferred),
+            component_min_area(preferred),
+            component_max_area(preferred)
+        ),
+        body,
+        ALLOW_SINGLE_FACE_FILL
+    )
+
+    if ok_preferred:
+        return True
+
+    if not ENABLE_RISKY_FALLBACK_VARIANTS:
+        return False
+
+    n = 2
+
+    while n <= chain_size:
+        variant = first_n_records(chain, n)
+
+        if len(variant) == len(preferred):
+            n = n + 1
+            continue
+
+        ok_n = try_fill_records(
+            variant,
+            "cadeia fallback {0} faces | area_min={1:.3f}, area_max={2:.3f}".format(
+                n,
+                component_min_area(variant),
+                component_max_area(variant)
+            ),
+            body,
+            ALLOW_SINGLE_FACE_FILL
+        )
+
+        if ok_n:
+            return True
+
+        n = n + 1
+
+    return False
+
+
+def clean_one_chain_attempt(body, failed_signatures):
+    protected = get_protected_faces(body)
+    seeds = collect_seed_records(body, protected)
+    member_records = collect_chain_member_records(body, protected)
+
+    print_seed_summary(seeds, member_records, protected)
+
+    if len(seeds) == 0:
+        feature_log("[CHAIN] Nenhuma semente pequena encontrada.")
+        return "NO_SEEDS"
+
+    if len(member_records) == 0:
+        feature_log("[CHAIN] Nenhum membro de cadeia encontrado.")
+        return "NO_MEMBERS"
+
+    for i in range(len(seeds)):
+        seed = seeds[i]
+
+        chain = build_chain_from_seed(seed, member_records, CHAIN_MAX_FACES)
+
+        if len(chain) == 0:
+            continue
+
+        if len(chain) == 1 and not ALLOW_SINGLE_FACE_FILL:
+            continue
+
+        sig = chain_signature(chain)
+
+        if signature_in_list(sig, failed_signatures):
+            continue
+
+        neighbor_count = len(chain) - 1
+
+        feature_log("[CHAIN] Tentando seed {0}/{1}: seed_area={2:.3f}, vizinhos={3}, assinatura={4}".format(
+            i + 1,
+            len(seeds),
+            seed["area_mm2"],
+            neighbor_count,
+            sig
+        ))
+
+        ok = try_chain_preferred_variant(
+            seed,
+            chain,
+            member_records,
+            body
+        )
+
+        if ok:
+            return "REMOVED"
+
+        failed_signatures.append(sig)
+        return "FAILED"
+
+    return "NO_VALID_CHAIN"
+
+
+def clean_feature_chains(body):
+    if not ENABLE_FEATURE_CHAIN_CLEAN:
+        return False
+
+    removed_global = False
+    total_attempts = 0
+    failed_signatures = []
+
+    for pass_id in range(CHAIN_CLEAN_PASSES):
+        log("")
+        log("[CHAIN PASS] Corpo '{0}' | ciclo {1}/{2}".format(
+            safe_name(body),
+            pass_id + 1,
+            CHAIN_CLEAN_PASSES
+        ))
+
+        removed_this_pass = False
+
+        while total_attempts < MAX_CHAIN_ATTEMPTS_PER_BODY:
+            total_attempts = total_attempts + 1
+
+            faces_before = get_body_face_count(body)
+
+            status = clean_one_chain_attempt(body, failed_signatures)
+
+            faces_after = get_body_face_count(body)
+
+            if status == "REMOVED":
+                removed_global = True
+                removed_this_pass = True
+                failed_signatures = []
+
+                log("[CHAIN PASS] Sucesso. Faces {0} -> {1}. Recalculando topologia.".format(
+                    faces_before,
+                    faces_after
+                ))
+
+                continue
+
+            if status == "NO_SEEDS":
+                log("[CHAIN PASS] Sem sementes pequenas. Encerrando etapa de cadeias.")
+                break
+
+            if status == "NO_MEMBERS":
+                log("[CHAIN PASS] Sem membros de cadeia. Encerrando etapa de cadeias.")
+                break
+
+            if status == "NO_VALID_CHAIN":
+                log("[CHAIN PASS] Nenhuma cadeia válida restante.")
+                break
+
+            if len(failed_signatures) > DEBUG_MAX_SEEDS_TO_PRINT:
+                log("[CHAIN PASS] Muitas assinaturas falhadas. Encerrando ciclo.")
+                break
+
+            if faces_after == faces_before:
+                continue
+
+            break
+
+        if not removed_this_pass:
+            log("[CHAIN PASS] Nenhuma cadeia removida neste ciclo.")
+            break
+
+    return removed_global
+
+
+# ============================================================
+# LIMPEZA DE FUROS/REMANESCENTES SEM SEED
+# ============================================================
+
+def print_remaining_hole_components(components):
+    hole_log("[HOLE] Componentes remanescentes encontrados: {0}".format(len(components)))
+
+    max_print = DEBUG_MAX_COMPONENTS_TO_PRINT
+
+    for i in range(len(components)):
+        if i >= max_print:
+            hole_log("[HOLE] ... componentes adicionais omitidos.")
+            break
+
+        comp = components[i]
+
+        hole_log("[HOLE] Comp {0}: faces={1}, area_min={2:.3f}, area_max={3:.3f}".format(
+            i + 1,
+            len(comp),
+            component_min_area(comp),
+            component_max_area(comp)
+        ))
+
+
+def select_remaining_hole_variant(component):
+    if component is None:
+        return []
+
+    size = len(component)
+
+    if size == 0:
+        return []
+
+    if size == 1:
+        if ALLOW_SINGLE_FACE_HOLE_FILL:
+            return component
+        return []
+
+    return component
+
+
+def try_remaining_hole_component(component, body):
+    if component is None:
+        return False
+
+    if len(component) == 0:
+        return False
+
+    # Recuperação adicional para dentes que sobraram na etapa de furos.
+    min_area = component_min_area(component)
+    max_area = component_max_area(component)
+
+    if min_area <= DENT_SEED_MAX_AREA_MM2 and max_area >= DENT_NEIGHBOR_MIN_AREA_MM2:
+        seed = component[0]
+
+        for i in range(len(component)):
+            if record_area(component[i]) <= DENT_SEED_MAX_AREA_MM2:
+                seed = component[i]
+                break
+
+        ok_dent = try_dent_seed_neighbor_pairs(
+            seed,
+            component,
+            component,
+            body,
+            "furo/remanescente dente"
+        )
+
+        if ok_dent:
+            return True
+
+    variant = select_remaining_hole_variant(component)
+
+    if len(variant) == 0:
+        return False
+
+    desc = "furo/remanescente | faces={0}, area_min={1:.3f}, area_max={2:.3f} em {3}".format(
+        len(variant),
+        component_min_area(variant),
+        component_max_area(variant),
+        safe_name(body)
+    )
+
+    return try_fill_records(
+        variant,
+        desc,
+        body,
+        ALLOW_SINGLE_FACE_HOLE_FILL
+    )
+
+
+def clean_remaining_holes_once(body, failed_signatures):
+    protected = get_protected_faces(body)
+    candidates = collect_remaining_hole_records(body, protected)
+
+    hole_log("[HOLE] Candidatas remanescentes: {0}, protegidas={1}".format(
+        len(candidates),
+        len(protected)
+    ))
+
+    if len(candidates) == 0:
+        return "NO_CANDIDATES"
+
+    components = build_connected_components(
+        candidates,
+        REMAINING_HOLE_MAX_COMPONENT_FACES
+    )
+
+    print_remaining_hole_components(components)
+
+    if len(components) == 0:
+        return "NO_COMPONENTS"
+
+    for i in range(len(components)):
+        comp = components[i]
+
+        if len(comp) > REMAINING_HOLE_MAX_COMPONENT_FACES:
+            continue
+
+        sig = chain_signature(comp)
+
+        if signature_in_list(sig, failed_signatures):
+            continue
+
+        hole_log("[HOLE] Tentando componente {0}/{1}: faces={2}, assinatura={3}".format(
+            i + 1,
+            len(components),
+            len(comp),
+            sig
+        ))
+
+        ok = try_remaining_hole_component(comp, body)
+
+        if ok:
+            return "REMOVED"
+
+        failed_signatures.append(sig)
+        return "FAILED"
+
+    return "NO_VALID_COMPONENT"
+
+
+def clean_remaining_holes(body):
+    if not ENABLE_REMAINING_HOLE_CLEAN:
+        return False
+
+    log("")
+    log("------------------------------------------------------------")
+    log("[ETAPA 4] Limpeza de furos/remanescentes sem seed")
+    log("------------------------------------------------------------")
+
+    removed_global = False
+    attempts = 0
+    failed_signatures = []
+
+    for pass_id in range(REMAINING_HOLE_CLEAN_PASSES):
+        log("")
+        log("[HOLE PASS] Corpo '{0}' | ciclo {1}/{2}".format(
+            safe_name(body),
+            pass_id + 1,
+            REMAINING_HOLE_CLEAN_PASSES
+        ))
+
+        removed_this_pass = False
+
+        while attempts < MAX_REMAINING_HOLE_ATTEMPTS:
+            attempts = attempts + 1
+
+            faces_before = get_body_face_count(body)
+
+            status = clean_remaining_holes_once(body, failed_signatures)
+
+            faces_after = get_body_face_count(body)
+
+            if status == "REMOVED":
+                removed_global = True
+                removed_this_pass = True
+                failed_signatures = []
+
+                log("[HOLE PASS] Sucesso. Faces {0} -> {1}. Recalculando topologia.".format(
+                    faces_before,
+                    faces_after
+                ))
+
+                continue
+
+            if status == "NO_CANDIDATES":
+                log("[HOLE PASS] Sem candidatas remanescentes.")
+                break
+
+            if status == "NO_COMPONENTS":
+                log("[HOLE PASS] Sem componentes remanescentes.")
+                break
+
+            if status == "NO_VALID_COMPONENT":
+                log("[HOLE PASS] Nenhum componente remanescente válido.")
+                break
+
+            if len(failed_signatures) > DEBUG_MAX_COMPONENTS_TO_PRINT:
+                log("[HOLE PASS] Muitas assinaturas falhadas. Encerrando.")
+                break
+
+            if faces_after == faces_before:
+                continue
+
+            break
+
+        if not removed_this_pass:
+            log("[HOLE PASS] Nenhum furo/remanescente removido neste ciclo.")
+            break
+
+    return removed_global
+
+
+# ============================================================
+# PIPELINE POR CORPO
+# ============================================================
+
+def clean_body(body):
+    if body is None:
+        return
+
+    log("")
+    log("============================================================")
+    log("[START] Limpando corpo: {0}".format(safe_name(body)))
+    log("Faces iniciais: {0}".format(get_body_face_count(body)))
+    log("============================================================")
+
+    # --------------------------------------------------------
+    # ETAPA 1 - Raios
+    # --------------------------------------------------------
+    if ENABLE_ROUND_CLEAN:
+        log("")
+        log("------------------------------------------------------------")
+        log("[ETAPA 1] Remoção incremental de raios")
+        log("------------------------------------------------------------")
+
+        clean_rounds_incremental(body)
+
+        log("[ETAPA 1] Faces após raios: {0}".format(
+            get_body_face_count(body)
+        ))
+
+    # --------------------------------------------------------
+    # ETAPA 2 - Arestas antes da limpeza de furos/cadeias
+    # --------------------------------------------------------
+    if ENABLE_PRE_CHAIN_EDGE_CLEAN:
+        clean_residual_edges(body, "ETAPA 2 - pré-cadeias")
+
+        log("[ETAPA 2] Faces após arestas pré-cadeias: {0}".format(
+            get_body_face_count(body)
+        ))
+
+    # --------------------------------------------------------
+    # ETAPA 3 - Cadeias com seed
+    # --------------------------------------------------------
+    if ENABLE_FEATURE_CHAIN_CLEAN:
+        log("")
+        log("------------------------------------------------------------")
+        log("[ETAPA 3] Limpeza por cadeias conectadas")
+        log("------------------------------------------------------------")
+
+        clean_feature_chains(body)
+
+        log("[ETAPA 3] Faces após cadeias: {0}".format(
+            get_body_face_count(body)
+        ))
+
+    # --------------------------------------------------------
+    # ETAPA 4 - Furos/remanescentes sem seed
+    # --------------------------------------------------------
+    if ENABLE_REMAINING_HOLE_CLEAN:
+        clean_remaining_holes(body)
+
+        log("[ETAPA 4] Faces após furos/remanescentes: {0}".format(
+            get_body_face_count(body)
+        ))
+
+    # --------------------------------------------------------
+    # ETAPA 5 - Arestas finais
+    # --------------------------------------------------------
+    if ENABLE_FINAL_EDGE_CLEAN:
+        clean_residual_edges(body, "ETAPA 5 - final")
+
+        log("[ETAPA 5] Faces após arestas finais: {0}".format(
+            get_body_face_count(body)
+        ))
+
+    log("[END] Corpo finalizado: {0}".format(safe_name(body)))
+
+
+# ============================================================
+# PIPELINE ROOT
+# ============================================================
+
+def clean_all_root_bodies():
+    log("")
+    log("============================================================")
+    log("[START] {0}".format(SCRIPT_VERSION))
+    log("[LOG] Arquivo: {0}".format(get_debug_log_path()))
+    log("[CONFIG] filtros={0} | match_component_path={1} | process_hidden={2}".format(
+        BODY_NAME_FILTERS,
+        BODY_FILTER_MATCH_COMPONENT_PATH,
+        PROCESS_HIDDEN_BODIES
+    ))
+    log("============================================================")
+
+    bodies = get_root_bodies()
+    
+    #result = FixExtraEdges.FindAndFix()
+    
+    if len(bodies) == 0:
+        log("[ERRO] Nenhum corpo encontrado na arvore.")
+        return
+
+    selected_bodies = []
+    skipped_filter = 0
+    skipped_hidden = 0
+    skipped_invalid = 0
+
+    for i in range(len(bodies)):
+        body = bodies[i]
+
+        if body is None:
+            skipped_invalid = skipped_invalid + 1
+            continue
+
+        if not body_is_alive_light(body):
+            skipped_invalid = skipped_invalid + 1
+            log("[SKIP] Corpo invalido/sem faces: {0}".format(safe_name(body)))
+            continue
+
+        if (not PROCESS_HIDDEN_BODIES) and (not body_is_visible(body)):
+            skipped_hidden = skipped_hidden + 1
+            log("[SKIP] Corpo oculto: {0}".format(safe_name(body)))
+            continue
+
+        if body_passes_name_filter(body):
+            selected_bodies.append(body)
+            log("[SELECT] {0} | path={1}".format(
+                safe_name(body),
+                body_parent_path_text(body)
+            ))
+        else:
+            skipped_filter = skipped_filter + 1
+            log("[SKIP] Corpo ignorado pelo filtro: {0} | path={1}".format(
+                safe_name(body),
+                body_parent_path_text(body)
+            ))
+
+    log("")
+    log("============================================================")
+    log("[ROOT] Corpos encontrados na arvore: {0}".format(len(bodies)))
+    log("[ROOT] Selecionados para limpeza: {0}".format(len(selected_bodies)))
+    log("[ROOT] Ignorados por filtro: {0}".format(skipped_filter))
+    log("[ROOT] Ignorados ocultos: {0}".format(skipped_hidden))
+    log("[ROOT] Ignorados invalidos: {0}".format(skipped_invalid))
+    log("============================================================")
+
+    for i in range(len(selected_bodies)):
+        body = selected_bodies[i]
+
+        try:
+            if not body_is_alive_light(body):
+                log("[SKIP] Corpo nao esta mais valido antes do processamento: {0}".format(
+                    safe_name(body)
+                ))
+                continue
+
+            log("")
+            log("[ROOT] Processando {0}/{1}: {2}".format(
+                i + 1,
+                len(selected_bodies),
+                safe_name(body)
+            ))
+
+            clean_body(body)
+        except Exception as e:
+            log("[ERRO] Falha geral limpando corpo '{0}': {1}".format(
+                safe_name(body),
+                e
+            ))
+
+    log("")
+    log("============================================================")
+    log("[DONE] Pipeline de limpeza finalizado.")
+    log("[DONE] Log: {0}".format(get_debug_log_path()))
+    log("============================================================")
+
+
+# EXECUÇÃO
+# ============================================================
+
+try:
+    clean_all_root_bodies()
+except Exception as main_error:
+    log("[FATAL] Erro geral no pipeline de limpeza: {0}".format(main_error))
