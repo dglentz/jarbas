@@ -1,0 +1,486 @@
+# -*- coding: utf-8 -*-
+
+import csv
+import os
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CSV_PATH = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\predictions_novo_modelo.csv"
+
+CONFIDENCE_LIMIT = 0.70
+
+VALID_CLASSES = [
+    "open_profile",
+    "rectangular_tube",
+    "curved_tube",
+    "flat_plate",
+    "folded_plate",
+    "other"
+]
+
+# Se True, permite executar novamente sem duplicar prefixos.
+# Ex:
+#   open_profile_123 + nova classe flat_plate -> flat_plate_123
+#   open_profile_123 + mesma classe open_profile -> mantém open_profile_123
+REPLACE_EXISTING_CLASS_PREFIX = True
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_str(value):
+    try:
+        if value is None:
+            return ""
+        return str(value).strip()
+    except:
+        return ""
+
+
+def safe_float(value):
+    try:
+        txt = safe_str(value).replace(",", ".")
+        if txt == "":
+            return 0.0
+        return float(txt)
+    except:
+        return 0.0
+
+
+def id_candidates(value):
+    """
+    Gera formas possíveis do mesmo ID para comparar CSV x nome do body.
+
+    Ex:
+        "10"      -> ["10"]
+        "10.0"    -> ["10.0", "10"]
+        "000010"  -> ["000010", "10"]
+    """
+    txt = safe_str(value)
+
+    candidates = []
+    used = set()
+
+    def add(v):
+        v = safe_str(v)
+        if v != "" and v not in used:
+            used.add(v)
+            candidates.append(v)
+
+    add(txt)
+
+    try:
+        f = float(txt)
+        if abs(f - int(f)) < 1e-9:
+            add(str(int(f)))
+    except:
+        pass
+
+    return candidates
+
+
+def split_existing_class_prefix(body_name):
+    """
+    Se o body já estiver renomeado como:
+        <classe>_<id_original>
+
+    retorna:
+        classe_existente, id_original
+
+    Caso contrário:
+        "", body_name
+
+    Isso permite reexecutar a macro sem perder o vínculo com o body_id do CSV.
+    """
+    name = safe_str(body_name)
+
+    for cls in VALID_CLASSES:
+        prefix = cls + "_"
+        if name.startswith(prefix):
+            return cls, name[len(prefix):]
+
+    return "", name
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+def read_csv_rows(csv_path):
+    rows = []
+
+    if not os.path.exists(csv_path):
+        MessageBox.Show("CSV not found:\n{}".format(csv_path))
+        return rows
+
+    with open(csv_path, "r") as f:
+        sample = f.read(4096)
+        f.seek(0)
+
+        delimiter = ";"
+        if sample.count(",") > sample.count(";"):
+            delimiter = ","
+
+        reader = csv.DictReader(f, delimiter=delimiter)
+
+        for row in reader:
+            rows.append(row)
+
+    return rows
+
+
+def get_valid_predictions(rows):
+    """
+    Retorna somente linhas com:
+        - body_id preenchido
+        - predicted_body_type preenchido
+        - prediction_confidence >= CONFIDENCE_LIMIT
+    """
+    predictions = []
+
+    ignored_low = 0
+    ignored_no_id = 0
+    ignored_no_class = 0
+    invalid_class_to_other = 0
+
+    for row in rows:
+        body_id = safe_str(row.get("body_id", ""))
+        cls = safe_str(row.get("predicted_body_type", ""))
+        conf = safe_float(row.get("prediction_confidence", ""))
+
+        if body_id == "":
+            ignored_no_id += 1
+            continue
+
+        if cls == "":
+            ignored_no_class += 1
+            continue
+
+        if conf < CONFIDENCE_LIMIT:
+            ignored_low += 1
+            continue
+
+        if cls not in VALID_CLASSES:
+            cls = "other"
+            invalid_class_to_other += 1
+
+        predictions.append({
+            "body_id": body_id,
+            "class": cls,
+            "confidence": conf
+        })
+
+    return predictions, ignored_low, ignored_no_id, ignored_no_class, invalid_class_to_other
+
+
+# ============================================================
+# MAPA DOS BODIES PELO NOME NA ÁRVORE
+# ============================================================
+
+def build_body_map_by_tree_name():
+    """
+    Varre os bodies da árvore e monta:
+
+        ID_do_body -> body
+
+    O nome do body deve ser o ID sequencial utilizado no CSV.
+
+    Também aceita bodies que já tenham sido renomeados anteriormente no padrão:
+
+        <classe>_<ID>
+
+    Ex:
+        123              -> mapeia 123
+        open_profile_123 -> mapeia open_profile_123 e 123
+    """
+    body_map = {}
+    duplicate_names = {}
+
+    bodies = list(GetRootPart().GetAllBodies())
+
+    for body in bodies:
+        try:
+            body_name = safe_str(body.GetName())
+        except:
+            body_name = ""
+
+        if body_name == "":
+            continue
+
+        existing_cls, body_id_part = split_existing_class_prefix(body_name)
+
+        keys_to_try = []
+
+        for key in id_candidates(body_name):
+            keys_to_try.append(key)
+
+        if body_id_part != body_name:
+            for key in id_candidates(body_id_part):
+                keys_to_try.append(key)
+
+        used_local = set()
+
+        for key in keys_to_try:
+            if key in used_local:
+                continue
+
+            used_local.add(key)
+
+            if key not in body_map:
+                body_map[key] = body
+            else:
+                duplicate_names[key] = duplicate_names.get(key, 1) + 1
+
+    return body_map, len(bodies), duplicate_names
+
+
+def find_body_by_id(body_map, body_id):
+    """
+    Procura o body pelo ID do CSV.
+    Testa o texto original e versões numéricas equivalentes.
+    """
+    for key in id_candidates(body_id):
+        body = body_map.get(key, None)
+        if body is not None:
+            return body
+
+    return None
+
+
+# ============================================================
+# RENOMEAR BODY
+# ============================================================
+
+def rename_body(body, new_name):
+    if body is None:
+        return False
+
+    try:
+        body.SetName(new_name)
+        return True
+    except:
+        pass
+
+    try:
+        body.Name = new_name
+        return True
+    except:
+        pass
+
+    return False
+
+
+def get_renamed_body_name(body, cls_name):
+    """
+    Gera o novo nome do body no padrão:
+
+        <classe>_<nome_original_sem_prefixo_de_classe>
+
+    Ex:
+        123              -> open_profile_123
+        open_profile_123 -> open_profile_123
+        open_profile_123 -> flat_plate_123, se a nova classe for flat_plate
+    """
+    original = ""
+
+    try:
+        original = safe_str(body.GetName())
+    except:
+        original = ""
+
+    if original == "":
+        return ""
+
+    existing_cls, original_id = split_existing_class_prefix(original)
+
+    if existing_cls != "" and REPLACE_EXISTING_CLASS_PREFIX:
+        base_name = original_id
+    else:
+        base_name = original
+
+    return "{}_{}".format(cls_name, base_name)
+
+
+def rename_group(bodies, cls_name):
+    """
+    Renomeia os bodies para:
+
+        <classe>_<nome_original>
+
+    Ex:
+        123 -> open_profile_123
+    """
+    renamed = 0
+    unchanged = 0
+    errors = 0
+
+    for body in bodies:
+        try:
+            new_name = get_renamed_body_name(body, cls_name)
+
+            if new_name == "":
+                errors += 1
+                continue
+
+            try:
+                current_name = safe_str(body.GetName())
+            except:
+                current_name = ""
+
+            if current_name == new_name:
+                unchanged += 1
+                continue
+
+            ok = rename_body(body, new_name)
+
+            if ok:
+                renamed += 1
+            else:
+                errors += 1
+
+        except:
+            errors += 1
+
+    return renamed, unchanged, errors
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def rename_by_ml_prediction(csv_path):
+    rows = read_csv_rows(csv_path)
+
+    if len(rows) == 0:
+        MessageBox.Show("No CSV rows read.")
+        return
+
+    predictions, ignored_low, ignored_no_id, ignored_no_class, invalid_class_to_other = get_valid_predictions(rows)
+
+    if len(predictions) == 0:
+        MessageBox.Show("No rows with confidence >= {}".format(CONFIDENCE_LIMIT))
+        return
+
+    body_map, total_bodies, duplicate_names = build_body_map_by_tree_name()
+
+    grouped = {}
+
+    for cls in VALID_CLASSES:
+        grouped[cls] = []
+
+    matched = 0
+    not_found = 0
+    duplicated_csv_id = 0
+
+    used_ids = set()
+    not_found_samples = []
+
+    for prediction in predictions:
+        body_id = safe_str(prediction["body_id"])
+        cls = prediction["class"]
+
+        # Evita processar o mesmo ID duas vezes.
+        # A comparação usa candidatos equivalentes para reduzir casos tipo 10 x 10.0.
+        duplicate = False
+
+        for key in id_candidates(body_id):
+            if key in used_ids:
+                duplicate = True
+                break
+
+        if duplicate:
+            duplicated_csv_id += 1
+            continue
+
+        for key in id_candidates(body_id):
+            used_ids.add(key)
+
+        body = find_body_by_id(body_map, body_id)
+
+        if body is None:
+            not_found += 1
+
+            if len(not_found_samples) < 20:
+                not_found_samples.append(body_id)
+
+            continue
+
+        grouped[cls].append(body)
+        matched += 1
+
+    total_renamed = 0
+    total_unchanged = 0
+    total_errors = 0
+    class_counts = {}
+    class_unchanged = {}
+    class_errors = {}
+
+    for cls in VALID_CLASSES:
+        bodies = grouped[cls]
+
+        class_counts[cls] = 0
+        class_unchanged[cls] = 0
+        class_errors[cls] = 0
+
+        if len(bodies) == 0:
+            continue
+
+        print("")
+        print("Renaming class '{}': {} bodies".format(cls, len(bodies)))
+
+        renamed, unchanged, errors = rename_group(bodies, cls)
+
+        class_counts[cls] = renamed
+        class_unchanged[cls] = unchanged
+        class_errors[cls] = errors
+
+        total_renamed += renamed
+        total_unchanged += unchanged
+        total_errors += errors
+
+        print("Finished '{}': renamed={}, unchanged={}, errors={}".format(cls, renamed, unchanged, errors))
+
+    msg = ""
+    msg += "ML rename finished.\n\n"
+    msg += "Bodies in document: {}\n".format(total_bodies)
+    msg += "Unique body-name IDs in tree: {}\n".format(len(body_map))
+    msg += "CSV rows: {}\n".format(len(rows))
+    msg += "Rows confidence >= {}: {}\n".format(CONFIDENCE_LIMIT, len(predictions))
+    msg += "Matched bodies: {}\n".format(matched)
+    msg += "Renamed bodies: {}\n".format(total_renamed)
+    msg += "Already correct / unchanged: {}\n".format(total_unchanged)
+    msg += "Not found: {}\n".format(not_found)
+    msg += "Rename errors: {}\n".format(total_errors)
+    msg += "Duplicated CSV IDs ignored: {}\n".format(duplicated_csv_id)
+    msg += "Duplicated body names in tree: {}\n".format(len(duplicate_names))
+    msg += "Ignored low confidence: {}\n".format(ignored_low)
+    msg += "Ignored empty body_id: {}\n".format(ignored_no_id)
+    msg += "Ignored empty class: {}\n".format(ignored_no_class)
+    msg += "Invalid classes sent to other: {}\n".format(invalid_class_to_other)
+
+    msg += "\n\nRenamed by class:\n"
+
+    for cls in VALID_CLASSES:
+        msg += "{}: renamed={}, unchanged={}, errors={}\n".format(
+            cls,
+            class_counts[cls],
+            class_unchanged[cls],
+            class_errors[cls]
+        )
+
+    if len(not_found_samples) > 0:
+        msg += "\nFirst not found IDs:\n"
+        msg += "\n".join(not_found_samples)
+
+    MessageBox.Show(msg)
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+rename_by_ml_prediction(CSV_PATH)
