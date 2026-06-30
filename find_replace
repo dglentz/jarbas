@@ -1,0 +1,5118 @@
+# Python Script, API Version = V251
+# -*- coding: utf-8 -*-
+# find_replace_bank_v19_second_pass_ansys25_v251.py
+
+import csv
+import os
+import shutil
+import math
+import traceback
+from datetime import datetime
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DATABASE_INDEX_CSV = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\Amostras\Banco_dados\database_index.csv"
+DATABASE_ITEM_FOLDER = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\Amostras\Banco_dados"
+REPLACEMENT_LOG_CSV = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\Amostras\Banco_dados\replace_instances_log.csv"
+
+# Diagnostic logs for industrial debugging.
+# Main log keeps the final result; these two files trace planning and execution step-by-step.
+DIAGNOSTIC_EVENT_LOG_CSV = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\Amostras\Banco_dados\replace_instances_debug_events.csv"
+DIAGNOSTIC_PLAN_LOG_CSV = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\Amostras\Banco_dados\replace_instances_plan_debug.csv"
+
+# V14 single text log. This is the fastest file to send back for diagnosis.
+FULL_TXT_LOG_PATH = r"Q:\4 - METODO_ELEMENTOS_FINITOS\52 - Macros\Projetos Macro\Códigos\Python\ML_Project\Amostras\Banco_dados\replace_instances_full_debug_log.txt"
+ENABLE_FULL_TXT_LOG = True
+
+ENABLE_DIAGNOSTIC_LOGS = False
+DEBUG_VERBOSE_CONSOLE = False
+DEBUG_LOG_REJECTED_CANDIDATES = False
+DEBUG_LOG_SKIPPED_CANDIDATES = False
+DEBUG_LOG_IMPORT_BODY_DETAILS = False
+DEBUG_LOG_TRANSFORM_DETAILS = False
+DEBUG_MAX_DETAIL_TEXT_LENGTH = 32000
+
+
+# Matching database rows.
+DATABASE_ROLE_TO_MATCH = "original_solid"
+ONLY_VISIBLE_BODIES = True
+PROCESS_ONLY_FIRST_N = 0
+MAX_REPLACEMENTS = 0
+
+# Avoid processing bodies created by this macro.
+SKIP_ALREADY_REPLACED = True
+SKIP_IMPORTED_REPLACEMENT_BODIES = True
+
+# Small/irrelevant bodies.
+MIN_AABB_MAX_MM = 10.0
+
+# Database file resolution.
+# Recommended after bank_register_v6: keep file_key equal to body/original item name.
+# The macro first tries: DATABASE_ITEM_FOLDER + file_key + ".scdocx".
+# If it does not exist, it falls back to the file_path stored in the CSV.
+PREFER_FILE_KEY_AS_DATABASE_FILENAME = True
+
+# Replacement behavior.
+DRY_RUN = False
+CREATE_TARGET_REFERENCE_PLANES = False
+DELETE_TARGET_REFERENCE_PLANES_AFTER = True
+
+# First collect all accepted matches from the initial assembly snapshot.
+# Only after the full list is built, start importing/replacing.
+# This avoids imported database bodies interfering with the search loop.
+PLAN_REPLACEMENTS_BEFORE_IMPORT = True
+
+# PCA axis polarity can be ambiguous for plates and symmetric parts.
+# This option tests right-handed sign combinations using the imported dirty solid
+# and the target dirty solid vertex clouds, then chooses the best orientation.
+USE_VERTEX_CLOUD_SIGN_RESOLUTION = True
+
+# Limit vertex cloud size used for orientation scoring.
+# Keep moderate for industrial assemblies.
+VERTEX_CLOUD_MAX_POINTS = 300
+
+# If the best orientation score is above this value, the log will warn,
+# but the macro will still use the best candidate.
+VERTEX_CLOUD_WARNING_SCORE_MM = 2.0
+
+# The original structural solid must remain in the assembly for engineering review.
+# In repeated/component instances, deleting one target can invalidate or remove other
+# occurrences that share the same master definition.
+# Options: "HIDE", "DELETE", "KEEP". Industrial validation default: KEEP.
+ORIGINAL_AFTER_REPLACEMENT = "HIDE"
+
+# Hard safety lock. When False, the macro will ignore DELETE/HIDE requests for
+# original target bodies and force KEEP. This prevents accidental loss of
+# structural components during validation runs.
+ALLOW_ORIGINAL_TARGET_DELETE_OR_HIDE = True
+
+# Store the target dirty-solid vertex cloud during the planning snapshot.
+# This prevents orientation scoring from failing later if SpaceClaim refreshes
+# or invalidates wrappers for repeated component instances.
+STORE_TARGET_VERTEX_CLOUD_IN_PLAN = True
+USE_PLANNED_TARGET_VERTEX_CLOUD_FOR_ORIENTATION = True
+
+# Since original targets are now kept, a second run could create duplicate
+# replacement surfaces. This skips a target if a DB_REPLACEMENT for the same
+# database key and target center already exists.
+SKIP_TARGETS_WITH_EXISTING_REPLACEMENT_AT_SAME_CENTER = True
+
+# Imported file normally contains original solid + treated midsurface.
+# V3 rule: DO NOT delete the imported dirty/source solid during the loop.
+# In SpaceClaim, inserted files can behave as dependent component definitions.
+# Deleting the imported original in the first replacement may remove it from later imports,
+# causing wrong positioning because the source frame is no longer available.
+DELETE_IMPORTED_NON_REPLACEMENT_BODIES = True
+
+# What to do with imported non-replacement bodies, normally the dirty source solid.
+# Options: "HIDE", "KEEP", "DELETE".
+# Industrial default is HIDE. Delete only after the workflow is fully validated.
+IMPORTED_NON_REPLACEMENT_BODY_ACTION = "DELETE"
+
+# During planning, store a dictionary/snapshot of each matched target frame.
+# Replacement uses that stored target frame instead of recalculating after imports/hides.
+STORE_TARGET_FRAME_IN_PLAN = True
+
+# Transform the complete imported set as one rigid group, not only the treated surface.
+# The source frame is computed from the imported dirty/original solid. The same rotation and
+# translation is applied to all bodies inserted from the database item file.
+# This preserves the internal offset between the original solid and the treated midsurface.
+TRANSFORM_ALL_IMPORTED_BODIES_AS_RIGID_SET = True
+
+# If True, the imported dirty/source solid is hidden only after the whole imported set is
+# spatially aligned to the target occurrence.
+CLEANUP_IMPORTED_SUPPORT_BODIES_AFTER_RIGID_TRANSFORM = True
+
+# After each imported set is aligned to one target occurrence, the positioned treated surface
+# is copied/pasted as an independent final body. Then the linked imported set is cleaned.
+# This avoids the SpaceClaim dependent-component behavior where later imports/moves of the
+# same database item can drag previous replacements into the same location.
+# Use a unique temporary copy of the .scdocx for each occurrence.
+# This prevents SpaceClaim from reusing the same linked component definition when the
+# same database item is inserted several times. In the diagnostic this was the main
+# cause of replacements accumulating names and/or moving to the wrong occurrence.
+USE_UNIQUE_TEMP_IMPORT_COPY_PER_PLAN = True
+UNIQUE_TEMP_IMPORT_FOLDER = os.path.join(DATABASE_ITEM_FOLDER, "_tmp_unique_imports")
+DELETE_UNIQUE_TEMP_IMPORT_FILES_AFTER_INSERT = False
+
+# Use the frame stored in database_index.csv as the source frame first.
+# This means the target instance frame and the database item frame are created
+# by the same rule/function, so positioning is based on equivalent local planes
+# instead of recalculating the imported source from possibly stale/reused bodies.
+USE_DATABASE_ROW_FRAME_AS_SOURCE_FIRST = True
+
+# Import each database item only once as an untouched TEMPLATE, then copy the
+# template replacement body for every planned target occurrence. This avoids
+# SpaceClaim reusing/modifying previous imported bodies or reference planes
+# when the same database item is inserted many times.
+USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW = True
+TEMPLATE_BODY_ACTION_AFTER_IMPORT = "KEEP"  # V11: KEEP. Hidden template can fail copy/paste in SpaceClaim.
+USE_VERTEX_CLOUD_ORIENTATION_IN_TEMPLATE_WORKFLOW = True
+ABORT_IF_TEMPLATE_COPY_FAILS = True
+FORCE_TEMPLATE_VISIBLE_BEFORE_COPY = True
+COPY_RESULT_USES_SNAPSHOT_TOKENS = True
+
+# In the template workflow the database item template must stay alive until all
+# occurrences have been copied. Therefore TEMPLATE_BODY_ACTION_AFTER_IMPORT should
+# remain KEEP during the loop. This cleanup runs only after all replacements finish.
+#
+# IMPORTANT: do not rename/delete the linked template bodies directly by default.
+# In SpaceClaim, directly editing/deleting a DesignBody that came from an inserted
+# .scdocx can mark the inserted item as modified and trigger the prompt:
+# "Save changes to the following item(s)?". V14 first tries to delete the inserted
+# component/container occurrence. If that is not found, it now keeps the template visible
+# and writes a full txt diagnostic log, so we do not mask a failed deletion as hide.
+CLEANUP_DATABASE_TEMPLATES_AFTER_REPLACEMENT = True
+TEMPLATE_CLEANUP_ACTION_AFTER_WORKFLOW = "DELETE"  # Options: "DELETE", "HIDE", "KEEP"
+DELETE_TEMPLATE_COMPONENTS_WHEN_SAFE = True
+RENAME_TEMPLATE_BODIES_AFTER_IMPORT = False
+TEMPLATE_DELETE_DIRECT_BODY_FALLBACK = False
+TEMPLATE_HIDE_IF_DELETE_FAILS = False
+TEMPLATE_COMPONENT_SAFETY_USES_BODY_SNAPSHOT_TOKENS = True
+
+# Some plates/brackets have ambiguous PCA axes. Sign flip is not enough;
+# X/Y/Z order can also be swapped. V12 tests all right-handed axis
+# permutations of the target frame using the dirty solid vertex cloud and
+# selects the variant with the lowest source-to-target vertex distance.
+USE_VERTEX_CLOUD_AXIS_PERMUTATION_RESOLUTION = True
+
+TEMPLATE_COMPONENT_PREFIX = "DB_TEMPLATE_"
+FINAL_REPLACEMENT_PREFIX = "DB_REPLACEMENT_"
+
+# Production filtering/performance.
+ENABLE_VOLUME_PREFILTER = True
+VOLUME_PREFILTER_REL_TOL = 0.40
+SKIP_EXISTING_DATABASE_ITEM_BODIES = True
+SKIP_DATABASE_COMPONENT_PATH_MATCHES = True
+DATABASE_FILE_KEYS = {}
+DATABASE_BODY_NAMES = {}
+
+# First pass preserves the original V17 behavior. After template cleanup, a second
+# planning/replacement pass can rescan the assembly and allow bodies that were
+# skipped in pass 1 only because their component path or name matched the database.
+# The existing-replacement guard still prevents duplicates.
+ENABLE_SECOND_REPLACEMENT_SCAN = True
+SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS = True
+SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS = True
+CURRENT_SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS = False
+CURRENT_SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS = False
+
+# Abort a plan if the selected imported replacement/source is a macro-generated body
+# from a previous plan. This protects repeated occurrences from stacking in one place.
+ABORT_IF_IMPORTED_SELECTION_IS_OLD_MACRO_BODY = True
+
+# Try to read bodies directly from the DocumentInsert/InsertFile result object before
+# falling back to before/after document snapshot detection. This is usually safer when
+# SpaceClaim refreshes wrappers after insert.
+PREFER_IMPORT_RESULT_CREATED_BODIES = True
+
+# Center-error validation after transform. It only warns by default because treated
+# midsurface center may differ slightly from the dirty original center.
+POST_TRANSFORM_CENTER_WARNING_MM = 5.0
+POST_TRANSFORM_CENTER_ABORT_MM = 0.0
+
+# With unique imports, we normally do not need copy/paste bake.
+# Copy/paste was failing in the diagnostic and the fallback kept linked definitions.
+BAKE_POSITIONED_REPLACEMENT_COPY = False
+
+# What to do with the linked imported set after the independent replacement copy is created.
+# Options: "DELETE", "HIDE", "KEEP".
+# DELETE is recommended here because the final replacement is the baked independent copy.
+IMPORTED_SET_AFTER_BAKE_ACTION = "DELETE"
+
+# If the independent copy fails, keep the V4 fallback behavior instead of failing the whole run.
+FALLBACK_TO_LINKED_REPLACEMENT_IF_BAKE_FAILS = True
+
+# Tag names for audit.
+# Avoid renaming repeated/instanced target masters during validation.
+# Renaming the target polluted names in the diagnostic:
+# REPLACED_BY_DB_...REPLACED_BY_DB_...75
+TAG_TARGET_ORIGINAL_BODY = False
+TAG_IMPORTED_REPLACEMENT_BODY = True
+
+# If true, accepted matches are colored before replacement.
+COLOR_ACCEPTED_MATCHES = False
+
+# ============================================================
+# MATCHING TOLERANCES - inherited from find_v1 logic
+# ============================================================
+
+STRICT_TOPOLOGY = False
+
+AABB_ABS_TOL_MM = 1.00
+AABB_REL_TOL = 0.010
+VOLUME_REL_TOL = 0.030
+AREA_REL_TOL = 0.080
+INERTIA_MEAN_ABS_TOL = 0.010
+INERTIA_MAX_ABS_TOL = 0.020
+
+FACE_COUNT_REL_TOL = 0.080
+EDGE_COUNT_REL_TOL = 0.120
+PLANAR_COUNT_REL_TOL = 0.150
+CYL_COUNT_REL_TOL = 0.200
+
+MAX_ACCEPT_SCORE = 0.075
+
+# Some compact curved/formed brackets have identical volume/area/topology, but
+# their sorted global AABB changes when the same part is inserted in a different
+# orientation. In V16 these parts died at the AABB gate even when they were
+# geometrically the same item. This fallback allows the AABB gate to be bypassed
+# only when mass/topology are almost exact and AABB is still reasonably close.
+ALLOW_AABB_FAIL_WHEN_MASS_TOPOLOGY_MATCH = True
+MASS_TOPOLOGY_VOLUME_REL_TOL = 0.001
+MASS_TOPOLOGY_AREA_REL_TOL = 0.001
+MASS_TOPOLOGY_INERTIA_MEAN_TOL = 0.020
+MASS_TOPOLOGY_INERTIA_MAX_TOL = 0.035
+MASS_TOPOLOGY_AABB_REL_TOL = 0.090
+MASS_TOPOLOGY_AABB_ABS_TOL_MM = 10.0
+MASS_TOPOLOGY_SCORE_MAX = 0.075
+
+SAFETY_FACTOR = 1.00
+
+# PCA/reference frame parameters.
+AXIS_AMBIGUITY_RATIO = 1.05
+AXIS_POLARITY_AMBIGUITY_RATIO = 1.02
+VERTEX_KEY_TOL_MM = 0.001
+
+# Body role classification.
+SURFACE_VOLUME_EPS_MM3 = 1e-6
+SURFACE_AABB_MIN_EPS_MM = 1e-6
+
+# Move/rotation tolerances.
+ANGLE_TOL_RAD = 1e-7
+TRANSLATION_TOL_M = 1e-8
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def safe_str(value):
+    try:
+        if value is None:
+            return ""
+        return str(value).strip()
+    except:
+        return ""
+
+def safe_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        txt = safe_str(value).replace(",", ".")
+        if txt == "":
+            return default
+        return float(txt)
+    except:
+        return default
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except:
+        return default
+
+def safe_div(a, b):
+    try:
+        if a is None or b is None:
+            return None
+        b = float(b)
+        if abs(b) < 1e-12:
+            return None
+        return float(a) / b
+    except:
+        return None
+
+def rel_err(a, b):
+    try:
+        a = safe_float(a)
+        b = safe_float(b)
+        if a is None or b is None:
+            return 999.0
+        denom = max(abs(a), abs(b), 1e-9)
+        return abs(a - b) / denom
+    except:
+        return 999.0
+
+def abs_err(a, b):
+    try:
+        a = safe_float(a)
+        b = safe_float(b)
+        if a is None or b is None:
+            return 999999.0
+        return abs(a - b)
+    except:
+        return 999999.0
+
+def get_name(obj):
+    try:
+        return safe_str(obj.GetName())
+    except:
+        pass
+
+    try:
+        return safe_str(obj.Name)
+    except:
+        return ""
+
+def set_name(obj, name):
+    try:
+        obj.SetName(name)
+        return True
+    except:
+        pass
+
+    try:
+        obj.Name = name
+        return True
+    except:
+        return False
+
+def make_safe_name(text):
+    text = safe_str(text)
+    if text == "":
+        text = "BODY"
+
+    out = []
+    for ch in text:
+        if ch.isalnum() or ch in ["_", "-"]:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out)
+
+def is_visible(obj):
+    try:
+        return bool(ViewHelper.GetObjectVisibility(obj))
+    except:
+        return True
+
+def ensure_folder_for_file(path):
+    try:
+        folder = os.path.dirname(path)
+        if folder and not os.path.exists(folder):
+            os.makedirs(folder)
+    except:
+        pass
+
+# ============================================================
+# SINGLE TXT LOG HELPERS
+# ============================================================
+
+def init_full_txt_log():
+    if not ENABLE_FULL_TXT_LOG:
+        return
+
+    try:
+        ensure_folder_for_file(FULL_TXT_LOG_PATH)
+        with open(FULL_TXT_LOG_PATH, "w") as f:
+            f.write("find_replace V17 full debug log\n")
+            f.write("started_at={}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            f.write("database_index={}\n".format(DATABASE_INDEX_CSV))
+            f.write("database_folder={}\n".format(DATABASE_ITEM_FOLDER))
+            f.write("template_cleanup_action={}\n".format(TEMPLATE_CLEANUP_ACTION_AFTER_WORKFLOW))
+            f.write("rename_template_bodies={}\n".format(RENAME_TEMPLATE_BODIES_AFTER_IMPORT))
+            f.write("direct_body_delete_fallback={}\n".format(TEMPLATE_DELETE_DIRECT_BODY_FALLBACK))
+            f.write("hide_if_delete_fails={}\n".format(TEMPLATE_HIDE_IF_DELETE_FAILS))
+            f.write("component_safety_uses_snapshot_tokens={}\n".format(TEMPLATE_COMPONENT_SAFETY_USES_BODY_SNAPSHOT_TOKENS))
+            f.write("delete_unique_temp_after_insert={}\n".format(DELETE_UNIQUE_TEMP_IMPORT_FILES_AFTER_INSERT))
+            f.write("-" * 120 + "\n")
+    except Exception as e:
+        print("Could not initialize full txt log: {}".format(e))
+
+def append_full_txt_log(event, detail=""):
+    if not ENABLE_FULL_TXT_LOG:
+        return
+    try:
+        ensure_folder_for_file(FULL_TXT_LOG_PATH)
+        with open(FULL_TXT_LOG_PATH, "a") as f:
+            f.write("[{}] {} | {}\n".format(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                safe_str(event),
+                safe_str(detail)
+            ))
+    except Exception as e:
+        try:
+            print("Could not write full txt log: {}".format(e))
+        except:
+            pass
+
+def append_full_txt_log_exception(event, error_obj=None):
+    try:
+        detail = safe_str(error_obj)
+        try:
+            tb = traceback.format_exc()
+            if tb and "None" not in tb:
+                detail += " | traceback=" + tb.replace("\n", " || ")
+        except:
+            pass
+        append_full_txt_log(event, detail)
+    except:
+        pass
+
+def append_full_txt_log_row(row):
+    try:
+        detail = (
+            "idx={event_index} | phase={phase} | plan={plan_id} | "
+            "target={target_body_name} | db_key={db_file_key} | "
+            "body={body_name} | body_role={body_role} | msg={message} | details={details}"
+        ).format(**row)
+        append_full_txt_log("DEBUG_EVENT", detail)
+    except Exception as e:
+        append_full_txt_log("DEBUG_EVENT_ROW_FAILED", safe_str(e))
+
+def starts_with_any(name, prefixes):
+    n = safe_str(name).upper()
+    for p in prefixes:
+        if n.startswith(safe_str(p).upper()):
+            return True
+    return False
+
+def hide_item(item):
+    try:
+        selection = Selection.Create(item)
+        visibility = VisibilityType.Hide
+        in_selected_view = False
+        ViewHelper.SetObjectVisibility(selection, visibility, in_selected_view)
+        return True
+    except Exception as e:
+        print("Could not hide item {}: {}".format(get_name(item), e))
+        return False
+
+def delete_item_old(item):
+    try:
+        Delete.Execute(Selection.Create(item))
+        return True
+    except Exception as e:
+        print("Could not delete item {}: {}".format(get_name(item), e))
+        return False
+
+def delete_item(item):
+    if item is None:
+        return False
+
+    tested = []
+
+    def try_delete(obj, label=""):
+        try:
+            if obj is None:
+                return False
+
+            Delete.Execute(Selection.Create(obj))
+
+            print("Deleted {} {}".format(label, get_name(obj)))
+            return True
+
+        except Exception as e:
+            tested.append("{} -> {}".format(label, e))
+            return False
+
+    # --------------------------------------------------------
+    # 1) tenta deletar o próprio item
+    # --------------------------------------------------------
+
+    if try_delete(item, "item"):
+        return True
+
+    # --------------------------------------------------------
+    # 2) tenta deletar parent/component
+    # --------------------------------------------------------
+
+    try:
+        parent = item.Parent
+
+        if try_delete(parent, "parent"):
+            return True
+
+    except:
+        pass
+
+    # --------------------------------------------------------
+    # 3) tenta componente ancestral
+    # --------------------------------------------------------
+
+    try:
+        comp = item.GetAncestor[Component]()
+
+        if try_delete(comp, "ancestor_component"):
+            return True
+
+    except:
+        pass
+
+    # --------------------------------------------------------
+    # 4) debug final
+    # --------------------------------------------------------
+
+    print(
+        "Could not delete item {} | attempts={}".format(
+            get_name(item),
+            " || ".join(tested)
+        )
+    )
+
+    return False
+
+def color_body_as_match(body):
+    if not COLOR_ACCEPTED_MATCHES:
+        return False
+    try:
+        selection = Selection.Create(body)
+        options = SetColorOptions()
+        options.FaceColorTarget = FaceColorTarget.Body
+        color = Color.FromArgb(255, 0, 220, 0)
+        ColorHelper.SetColor(selection, options, color)
+        return True
+    except Exception as e:
+        print("Could not color body {}: {}".format(get_name(body), e))
+        return False
+
+# ============================================================
+# GEOMETRIC SIGNATURE
+# ============================================================
+
+def get_body_aabb_mm(body):
+    try:
+        bbox = body.Shape.GetBoundingBox(Matrix.Identity)
+        dx = abs(bbox.MaxCorner.X - bbox.MinCorner.X) * 1000.0
+        dy = abs(bbox.MaxCorner.Y - bbox.MinCorner.Y) * 1000.0
+        dz = abs(bbox.MaxCorner.Z - bbox.MinCorner.Z) * 1000.0
+        dims = sorted([dx, dy, dz])
+        return {
+            "aabb_x_mm": dx,
+            "aabb_y_mm": dy,
+            "aabb_z_mm": dz,
+            "aabb_min_mm": dims[0],
+            "aabb_mid_mm": dims[1],
+            "aabb_max_mm": dims[2],
+            "aabb_ratio_max_min": safe_div(dims[2], dims[0]),
+            "aabb_ratio_mid_min": safe_div(dims[1], dims[0])
+        }
+    except:
+        return {
+            "aabb_x_mm": None,
+            "aabb_y_mm": None,
+            "aabb_z_mm": None,
+            "aabb_min_mm": None,
+            "aabb_mid_mm": None,
+            "aabb_max_mm": None,
+            "aabb_ratio_max_min": None,
+            "aabb_ratio_mid_min": None
+        }
+
+def get_body_surface_area_mm2(body):
+    try:
+        total = 0.0
+        for face in body.Faces:
+            try:
+                total += float(face.Area) * 1000.0 * 1000.0
+            except:
+                pass
+        return total
+    except:
+        return None
+
+def get_body_volume_mm3(body):
+    try:
+        return float(body.Shape.Volume) * 1000.0 ** 3
+    except:
+        pass
+
+    try:
+        return float(body.Volume) * 1000.0 ** 3
+    except:
+        return None
+
+def get_num_faces(body):
+    try:
+        return int(body.Faces.Count)
+    except:
+        try:
+            return len(list(body.Faces))
+        except:
+            return 0
+
+def get_unique_edges(body):
+    edges = []
+    try:
+        for face in body.Faces:
+            for edge in face.Edges:
+                if edge not in edges:
+                    edges.append(edge)
+    except:
+        pass
+    return edges
+
+def get_num_edges(body):
+    try:
+        return len(get_unique_edges(body))
+    except:
+        return 0
+
+def get_face_type_counts(body):
+    counts = {}
+    try:
+        for face in body.Faces:
+            try:
+                gname = safe_str(face.Shape.Geometry.GetType().Name)
+            except:
+                gname = "Unknown"
+            counts[gname] = counts.get(gname, 0) + 1
+    except:
+        pass
+    return counts
+
+def get_center_mm(body):
+    try:
+        bbox = body.Shape.GetBoundingBox(Matrix.Identity)
+        c = bbox.Center
+        return c.X * 1000.0, c.Y * 1000.0, c.Z * 1000.0
+    except:
+        return None, None, None
+
+def get_inertia_signature_from_aabb(aabb):
+    x = aabb.get("aabb_x_mm")
+    y = aabb.get("aabb_y_mm")
+    z = aabb.get("aabb_z_mm")
+
+    if x is None or y is None or z is None:
+        return None, None, None
+
+    ixx = y * y + z * z
+    iyy = x * x + z * z
+    izz = x * x + y * y
+
+    vals = sorted([ixx, iyy, izz])
+    s = vals[0] + vals[1] + vals[2]
+
+    if abs(s) < 1e-12:
+        return None, None, None
+
+    return vals[0] / s, vals[1] / s, vals[2] / s
+
+def classify_body_role(aabb, volume, num_faces):
+    try:
+        if volume is None:
+            volume = 0.0
+
+        aabb_min = aabb.get("aabb_min_mm")
+
+        if abs(float(volume)) <= SURFACE_VOLUME_EPS_MM3:
+            return "treated_surface"
+        if aabb_min is not None and abs(float(aabb_min)) <= SURFACE_AABB_MIN_EPS_MM:
+            return "treated_surface"
+        if num_faces <= 2 and abs(float(volume)) <= SURFACE_VOLUME_EPS_MM3:
+            return "treated_surface"
+
+        return "original_solid"
+    except:
+        return "unknown"
+
+def build_body_signature(body):
+    aabb = get_body_aabb_mm(body)
+    face_counts = get_face_type_counts(body)
+    i1, i2, i3 = get_inertia_signature_from_aabb(aabb)
+    cx, cy, cz = get_center_mm(body)
+
+    row = {}
+    row["body_name"] = get_name(body)
+    row["body_role_guess"] = classify_body_role(aabb, get_body_volume_mm3(body), get_num_faces(body))
+    row["num_faces"] = get_num_faces(body)
+    row["num_edges"] = get_num_edges(body)
+    row["num_planar_faces"] = face_counts.get("Plane", 0)
+    row["num_cylindrical_faces"] = face_counts.get("Cylinder", 0)
+    row["num_conical_faces"] = face_counts.get("Cone", 0)
+    row["num_toroidal_faces"] = face_counts.get("Torus", 0)
+    row["body_surface_area_mm2"] = get_body_surface_area_mm2(body)
+    row["body_volume_mm3"] = get_body_volume_mm3(body)
+
+    for k in aabb:
+        row[k] = aabb[k]
+
+    row["center_x_mm"] = cx
+    row["center_y_mm"] = cy
+    row["center_z_mm"] = cz
+    row["inertia_norm_1"] = i1
+    row["inertia_norm_2"] = i2
+    row["inertia_norm_3"] = i3
+    return row
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def read_database_original_solids():
+    global DATABASE_FILE_KEYS
+    global DATABASE_BODY_NAMES
+    rows = []
+    DATABASE_FILE_KEYS = {}
+    DATABASE_BODY_NAMES = {}
+
+    if not os.path.exists(DATABASE_INDEX_CSV):
+        print("database_index.csv not found:")
+        print(DATABASE_INDEX_CSV)
+        return rows
+
+    with open(DATABASE_INDEX_CSV, "r") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            role = safe_str(row.get("body_role_guess", ""))
+            if role != DATABASE_ROLE_TO_MATCH:
+                continue
+
+            rows.append(row)
+
+            file_key = safe_str(row.get("file_key", ""))
+            body_name = safe_str(row.get("body_name", ""))
+
+            if file_key != "":
+                DATABASE_FILE_KEYS[file_key.upper()] = True
+            if body_name != "":
+                DATABASE_BODY_NAMES[body_name.upper()] = True
+
+    print("DB original_solid rows loaded: {}".format(len(rows)))
+    return rows
+
+def resolve_database_item_file_path(db_row):
+    file_key = safe_str(db_row.get("file_key", ""))
+    csv_path = safe_str(db_row.get("file_path", ""))
+
+    candidate_from_key = ""
+    if file_key != "":
+        candidate_from_key = os.path.join(DATABASE_ITEM_FOLDER, file_key + ".scdocx")
+
+    if PREFER_FILE_KEY_AS_DATABASE_FILENAME:
+        if candidate_from_key != "" and os.path.exists(candidate_from_key):
+            return candidate_from_key, "file_key_filename"
+        if csv_path != "" and os.path.exists(csv_path):
+            return csv_path, "csv_file_path"
+    else:
+        if csv_path != "" and os.path.exists(csv_path):
+            return csv_path, "csv_file_path"
+        if candidate_from_key != "" and os.path.exists(candidate_from_key):
+            return candidate_from_key, "file_key_filename"
+
+    # Return the preferred path even if it does not exist, so the log is explicit.
+    if candidate_from_key != "":
+        return candidate_from_key, "missing_file_key_filename"
+    return csv_path, "missing_csv_file_path"
+
+# ============================================================
+# MATCHING GATES AND SCORE
+# ============================================================
+
+def aabb_abs_errors(target, db):
+    e_min = abs_err(target.get("aabb_min_mm"), db.get("aabb_min_mm"))
+    e_mid = abs_err(target.get("aabb_mid_mm"), db.get("aabb_mid_mm"))
+    e_max = abs_err(target.get("aabb_max_mm"), db.get("aabb_max_mm"))
+    e_mean = (e_min + e_mid + e_max) / 3.0
+    e_max_component = max(e_min, e_mid, e_max)
+    return e_mean, e_max_component, e_min, e_mid, e_max
+
+def aabb_rel_error(target, db):
+    e1 = rel_err(target.get("aabb_min_mm"), db.get("aabb_min_mm"))
+    e2 = rel_err(target.get("aabb_mid_mm"), db.get("aabb_mid_mm"))
+    e3 = rel_err(target.get("aabb_max_mm"), db.get("aabb_max_mm"))
+    return (e1 + e2 + e3) / 3.0
+
+def volume_error(target, db):
+    return rel_err(target.get("body_volume_mm3"), db.get("body_volume_mm3"))
+
+def area_error(target, db):
+    return rel_err(target.get("body_surface_area_mm2"), db.get("body_surface_area_mm2"))
+
+def inertia_errors(target, db):
+    t1 = safe_float(target.get("inertia_norm_1"))
+    t2 = safe_float(target.get("inertia_norm_2"))
+    t3 = safe_float(target.get("inertia_norm_3"))
+    d1 = safe_float(db.get("inertia_norm_1"))
+    d2 = safe_float(db.get("inertia_norm_2"))
+    d3 = safe_float(db.get("inertia_norm_3"))
+
+    if t1 is None or t2 is None or t3 is None:
+        return 999.0, 999.0, 999.0, 999.0, 999.0
+    if d1 is None or d2 is None or d3 is None:
+        return 999.0, 999.0, 999.0, 999.0, 999.0
+
+    e1 = abs(t1 - d1)
+    e2 = abs(t2 - d2)
+    e3 = abs(t3 - d3)
+    return (e1 + e2 + e3) / 3.0, max(e1, e2, e3), e1, e2, e3
+
+def topology_errors(target, db):
+    e_faces = rel_err(target.get("num_faces"), db.get("num_faces"))
+    e_edges = rel_err(target.get("num_edges"), db.get("num_edges"))
+    e_planar = rel_err(target.get("num_planar_faces"), db.get("num_planar_faces"))
+    e_cyl = rel_err(target.get("num_cylindrical_faces"), db.get("num_cylindrical_faces"))
+    return e_faces, e_edges, e_planar, e_cyl
+
+def is_slender_aabb_signature(sig):
+    ratio = safe_float(sig.get("aabb_ratio_max_min"), None)
+    if ratio is None:
+        amin = safe_float(sig.get("aabb_min_mm"), None)
+        amax = safe_float(sig.get("aabb_max_mm"), None)
+        if amin is None or amax is None or abs(amin) < 1e-9:
+            return False
+        ratio = amax / amin
+    return ratio >= 20.0
+
+def passes_aabb_gate(target, db):
+    e_abs_mean, e_abs_max, e_abs_min, e_abs_mid, e_abs_long = aabb_abs_errors(target, db)
+
+    t_min = safe_float(target.get("aabb_min_mm"), None)
+    t_mid = safe_float(target.get("aabb_mid_mm"), None)
+    t_max = safe_float(target.get("aabb_max_mm"), None)
+
+    d_min = safe_float(db.get("aabb_min_mm"), None)
+    d_mid = safe_float(db.get("aabb_mid_mm"), None)
+    d_max = safe_float(db.get("aabb_max_mm"), None)
+
+    if t_min is None or t_mid is None or t_max is None:
+        return False
+    if d_min is None or d_mid is None or d_max is None:
+        return False
+
+    if is_slender_aabb_signature(target) and is_slender_aabb_signature(db):
+        e_mid_rel = rel_err(t_mid, d_mid)
+        e_max_rel = rel_err(t_max, d_max)
+        e_mid_abs = abs(t_mid - d_mid)
+        e_max_abs = abs(t_max - d_max)
+
+        if e_mid_abs > 5.0 * SAFETY_FACTOR:
+            return False
+        if e_max_abs > 5.0 * SAFETY_FACTOR:
+            return False
+        if e_mid_rel > 0.030 * SAFETY_FACTOR:
+            return False
+        if e_max_rel > 0.010 * SAFETY_FACTOR:
+            return False
+        return True
+
+    e_rel = aabb_rel_error(target, db)
+
+    if e_abs_max > AABB_ABS_TOL_MM * SAFETY_FACTOR:
+        return False
+    if e_rel > AABB_REL_TOL * SAFETY_FACTOR:
+        return False
+
+    return True
+
+def topology_integer_signature_matches(target, db):
+    """
+    V17 helper.
+    Checks the stable topological counters exactly. This is deliberately stricter
+    than the normal topology gate because it is used only to bypass AABB failures.
+    """
+    fields = [
+        "num_faces",
+        "num_edges",
+        "num_planar_faces",
+        "num_cylindrical_faces",
+        "num_conical_faces",
+        "num_toroidal_faces"
+    ]
+
+    for field in fields:
+        t = safe_int(target.get(field), None)
+        d = safe_int(db.get(field), None)
+        if t is None or d is None:
+            return False
+        if t != d:
+            return False
+
+    return True
+
+def passes_mass_topology_aabb_fallback(target, db, metrics=None):
+    """
+    This does NOT loosen the whole matcher. It only bypasses AABB when:
+      - volume and area are practically identical;
+      - face/edge/type counters are exactly identical;
+      - inertia from AABB is still reasonably close;
+      - AABB is not wildly different.
+
+    Intended case from diagnostic:
+      DB folded_plate_6: 48.011 x 90.009 x 90.009
+      target Filete10:  51.114 x 90.009 x 91.625
+      volume/area/faces/edges identical, but strict AABB failed.
+    """
+    if not ALLOW_AABB_FAIL_WHEN_MASS_TOPOLOGY_MATCH:
+        return False
+
+    if metrics is None:
+        metrics = final_match_score(target, db)
+
+    e_abs_max = safe_float(metrics.get("e_aabb_abs_max"), 999999.0)
+    e_aabb_rel = safe_float(metrics.get("e_aabb_rel"), 999999.0)
+    e_vol = safe_float(metrics.get("e_volume"), 999999.0)
+    e_area = safe_float(metrics.get("e_area"), 999999.0)
+    e_inertia_mean = safe_float(metrics.get("e_inertia_mean"), 999999.0)
+    e_inertia_max = safe_float(metrics.get("e_inertia_max"), 999999.0)
+    score = safe_float(metrics.get("score"), 999999.0)
+
+    if e_abs_max > MASS_TOPOLOGY_AABB_ABS_TOL_MM * SAFETY_FACTOR:
+        return False
+    if e_aabb_rel > MASS_TOPOLOGY_AABB_REL_TOL * SAFETY_FACTOR:
+        return False
+    if e_vol > MASS_TOPOLOGY_VOLUME_REL_TOL * SAFETY_FACTOR:
+        return False
+    if e_area > MASS_TOPOLOGY_AREA_REL_TOL * SAFETY_FACTOR:
+        return False
+    if not topology_integer_signature_matches(target, db):
+        return False
+    if e_inertia_mean > MASS_TOPOLOGY_INERTIA_MEAN_TOL * SAFETY_FACTOR:
+        return False
+    if e_inertia_max > MASS_TOPOLOGY_INERTIA_MAX_TOL * SAFETY_FACTOR:
+        return False
+    if score > MASS_TOPOLOGY_SCORE_MAX * SAFETY_FACTOR:
+        return False
+    return True
+
+def passes_volume_gate(target, db):
+    return volume_error(target, db) <= VOLUME_REL_TOL * SAFETY_FACTOR
+
+def passes_area_gate(target, db):
+    return area_error(target, db) <= AREA_REL_TOL * SAFETY_FACTOR
+
+def passes_inertia_gate(target, db):
+    e_mean, e_max, e1, e2, e3 = inertia_errors(target, db)
+    if e_mean > INERTIA_MEAN_ABS_TOL * SAFETY_FACTOR:
+        return False
+    if e_max > INERTIA_MAX_ABS_TOL * SAFETY_FACTOR:
+        return False
+    return True
+
+def passes_topology_gate(target, db):
+    if not STRICT_TOPOLOGY:
+        return True
+    e_faces, e_edges, e_planar, e_cyl = topology_errors(target, db)
+    if e_faces > FACE_COUNT_REL_TOL * SAFETY_FACTOR:
+        return False
+    if e_edges > EDGE_COUNT_REL_TOL * SAFETY_FACTOR:
+        return False
+    if e_planar > PLANAR_COUNT_REL_TOL * SAFETY_FACTOR:
+        return False
+    if e_cyl > CYL_COUNT_REL_TOL * SAFETY_FACTOR:
+        return False
+    return True
+
+def final_match_score(target, db):
+    e_abs_mean, e_abs_max, e_abs_min, e_abs_mid, e_abs_long = aabb_abs_errors(target, db)
+    e_aabb_rel = aabb_rel_error(target, db)
+    e_vol = volume_error(target, db)
+    e_area = area_error(target, db)
+    e_inertia_mean, e_inertia_max, e_i1, e_i2, e_i3 = inertia_errors(target, db)
+    e_faces, e_edges, e_planar, e_cyl = topology_errors(target, db)
+    e_topology = (e_faces + e_edges + e_planar + e_cyl) / 4.0
+
+    score = (
+        0.45 * e_aabb_rel +
+        0.20 * e_inertia_mean +
+        0.20 * e_area +
+        0.10 * e_vol +
+        0.05 * e_topology
+    )
+
+    return {
+        "score": score,
+        "e_aabb_abs_mean": e_abs_mean,
+        "e_aabb_abs_max": e_abs_max,
+        "e_aabb_abs_min": e_abs_min,
+        "e_aabb_abs_mid": e_abs_mid,
+        "e_aabb_abs_long": e_abs_long,
+        "e_aabb_rel": e_aabb_rel,
+        "e_volume": e_vol,
+        "e_area": e_area,
+        "e_inertia_mean": e_inertia_mean,
+        "e_inertia_max": e_inertia_max,
+        "e_topology": e_topology,
+        "e_faces": e_faces,
+        "e_edges": e_edges,
+        "e_planar": e_planar,
+        "e_cyl": e_cyl
+    }
+
+def passes_volume_prefilter(target, db):
+    if not ENABLE_VOLUME_PREFILTER:
+        return True
+
+    t_vol = safe_float(target.get("body_volume_mm3"), None)
+    d_vol = safe_float(db.get("body_volume_mm3"), None)
+    if t_vol is None or d_vol is None:
+        return True
+    if abs(t_vol) < 1e-9 or abs(d_vol) < 1e-9:
+        return True
+    return rel_err(t_vol, d_vol) <= VOLUME_PREFILTER_REL_TOL
+
+def find_best_database_match_precise(target_sig, db_rows):
+    best = None
+    best_metrics = None
+    best_score = None
+    count_total = 0
+    count_pass_aabb = 0
+    count_pass_aabb_relaxed = 0
+    count_pass_volume = 0
+    count_pass_area = 0
+    count_pass_inertia = 0
+    count_pass_topology = 0
+    count_pass_final = 0
+
+    for db in db_rows:
+        count_total += 1
+
+        if not passes_volume_prefilter(target_sig, db):
+            continue
+
+        metrics = final_match_score(target_sig, db)
+        score = metrics.get("score")
+
+        aabb_strict_ok = passes_aabb_gate(target_sig, db)
+        aabb_relaxed_ok = False
+
+        if not aabb_strict_ok:
+            aabb_relaxed_ok = passes_mass_topology_aabb_fallback(target_sig, db, metrics)
+
+        if not aabb_strict_ok and not aabb_relaxed_ok:
+            continue
+
+        count_pass_aabb += 1
+        if aabb_relaxed_ok and not aabb_strict_ok:
+            count_pass_aabb_relaxed += 1
+            try:
+                metrics["match_mode"] = "AABB_RELAXED_BY_MASS_TOPOLOGY"
+            except:
+                pass
+
+        if not passes_volume_gate(target_sig, db):
+            continue
+        count_pass_volume += 1
+
+        if not passes_area_gate(target_sig, db):
+            continue
+        count_pass_area += 1
+
+        if not passes_inertia_gate(target_sig, db):
+            # its wider industrial limit, do not reject here using the legacy
+            # strict AABB-inertia threshold.
+            if not aabb_relaxed_ok:
+                continue
+        count_pass_inertia += 1
+
+        if not passes_topology_gate(target_sig, db):
+            continue
+        count_pass_topology += 1
+
+        # For the strict path, keep the legacy score rule.
+        # For the relaxed path, passes_mass_topology_aabb_fallback has already
+        # checked MASS_TOPOLOGY_SCORE_MAX.
+        if aabb_strict_ok:
+            score_ok = score <= MAX_ACCEPT_SCORE * SAFETY_FACTOR
+        else:
+            score_ok = score <= MASS_TOPOLOGY_SCORE_MAX * SAFETY_FACTOR
+
+        if score_ok:
+            count_pass_final += 1
+            if best_score is None or score < best_score:
+                best_score = score
+                best = db
+                best_metrics = metrics
+
+    counters = {
+        "count_total_db": count_total,
+        "count_pass_aabb": count_pass_aabb,
+        "count_pass_aabb_relaxed": count_pass_aabb_relaxed,
+        "count_pass_volume": count_pass_volume,
+        "count_pass_area": count_pass_area,
+        "count_pass_inertia": count_pass_inertia,
+        "count_pass_topology": count_pass_topology,
+        "count_pass_final": count_pass_final
+    }
+    return best, best_score, best_metrics, counters
+
+# ============================================================
+# REFERENCE FRAME / PCA
+# ============================================================
+
+def point_to_tuple_mm(p):
+    return (p.X * 1000.0, p.Y * 1000.0, p.Z * 1000.0)
+
+def vector_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+def vector_cross(a, b):
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+    ]
+
+def vector_norm(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+def vector_normalize(v):
+    n = vector_norm(v)
+    if n < 1e-12:
+        return None
+    return [v[0] / n, v[1] / n, v[2] / n]
+
+def vector_scale(v, s):
+    return [v[0] * s, v[1] * s, v[2] * s]
+
+def vector_add(a, b):
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+
+def vector_sub(a, b):
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+def clamp(value, min_value, max_value):
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    return value
+
+def extract_unique_vertices_mm_from_body(body):
+    vertices = []
+    used = {}
+    try:
+        for face in body.Faces:
+            for edge in face.Edges:
+                for p in [edge.Shape.StartVertex.Position, edge.Shape.EndVertex.Position]:
+                    x, y, z = point_to_tuple_mm(p)
+                    key = (
+                        int(round(x / VERTEX_KEY_TOL_MM)),
+                        int(round(y / VERTEX_KEY_TOL_MM)),
+                        int(round(z / VERTEX_KEY_TOL_MM))
+                    )
+                    if key not in used:
+                        used[key] = True
+                        vertices.append((x, y, z))
+    except:
+        pass
+    return vertices
+
+def centroid_from_vertices_mm(vertices):
+    n = len(vertices)
+    if n == 0:
+        return None
+    x = sum(p[0] for p in vertices) / float(n)
+    y = sum(p[1] for p in vertices) / float(n)
+    z = sum(p[2] for p in vertices) / float(n)
+    return (x, y, z)
+
+def covariance_matrix_from_vertices_mm(vertices, center):
+    C = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    n = float(len(vertices))
+    for p in vertices:
+        dx = p[0] - center[0]
+        dy = p[1] - center[1]
+        dz = p[2] - center[2]
+        C[0][0] += dx * dx
+        C[0][1] += dx * dy
+        C[0][2] += dx * dz
+        C[1][1] += dy * dy
+        C[1][2] += dy * dz
+        C[2][2] += dz * dz
+
+    C[0][0] /= n
+    C[0][1] /= n
+    C[0][2] /= n
+    C[1][1] /= n
+    C[1][2] /= n
+    C[2][2] /= n
+    C[1][0] = C[0][1]
+    C[2][0] = C[0][2]
+    C[2][1] = C[1][2]
+    return C
+
+def sort_eigen_pairs_descending(pairs):
+    # Manual sort to avoid IronPython issues with lambda/key in some SpaceClaim sessions.
+    result = list(pairs)
+    n = len(result)
+    for i in range(n):
+        max_i = i
+        for j in range(i + 1, n):
+            if result[j][0] > result[max_i][0]:
+                max_i = j
+        if max_i != i:
+            tmp = result[i]
+            result[i] = result[max_i]
+            result[max_i] = tmp
+    return result
+
+def jacobi_eigen_3x3_symmetric(A):
+    a = [
+        [float(A[0][0]), float(A[0][1]), float(A[0][2])],
+        [float(A[1][0]), float(A[1][1]), float(A[1][2])],
+        [float(A[2][0]), float(A[2][1]), float(A[2][2])]
+    ]
+
+    v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+    for iteration in range(60):
+        p = 0
+        q = 1
+        max_off = abs(a[0][1])
+
+        if abs(a[0][2]) > max_off:
+            p = 0
+            q = 2
+            max_off = abs(a[0][2])
+
+        if abs(a[1][2]) > max_off:
+            p = 1
+            q = 2
+            max_off = abs(a[1][2])
+
+        if max_off < 1e-10:
+            break
+
+        app = a[p][p]
+        aqq = a[q][q]
+        apq = a[p][q]
+        phi = 0.5 * math.atan2(2.0 * apq, aqq - app)
+        c = math.cos(phi)
+        s = math.sin(phi)
+
+        for i in range(3):
+            if i != p and i != q:
+                aip = a[i][p]
+                aiq = a[i][q]
+                a[i][p] = c * aip - s * aiq
+                a[p][i] = a[i][p]
+                a[i][q] = s * aip + c * aiq
+                a[q][i] = a[i][q]
+
+        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq
+        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq
+        a[p][q] = 0.0
+        a[q][p] = 0.0
+
+        for i in range(3):
+            vip = v[i][p]
+            viq = v[i][q]
+            v[i][p] = c * vip - s * viq
+            v[i][q] = s * vip + c * viq
+
+    pairs = []
+    for j in range(3):
+        vec = [v[0][j], v[1][j], v[2][j]]
+        vec = vector_normalize(vec)
+        if vec is None:
+            vec = [0.0, 0.0, 0.0]
+        pairs.append((a[j][j], vec))
+
+    return sort_eigen_pairs_descending(pairs)
+
+def orient_axis_by_geometry(axis, vertices, center, axis_name, warnings):
+    projections = []
+    for p in vertices:
+        r = [p[0] - center[0], p[1] - center[1], p[2] - center[2]]
+        projections.append(vector_dot(r, axis))
+
+    if len(projections) == 0:
+        warnings.append(axis_name + " polarity could not be evaluated")
+        return axis
+
+    pmax = max(projections)
+    pmin = min(projections)
+    pos_extent = abs(pmax)
+    neg_extent = abs(pmin)
+    ratio = max(pos_extent, neg_extent) / max(min(pos_extent, neg_extent), 1e-9)
+
+    if ratio < AXIS_POLARITY_AMBIGUITY_RATIO:
+        warnings.append(axis_name + " polarity is ambiguous")
+
+    if neg_extent > pos_extent:
+        axis = vector_scale(axis, -1.0)
+
+    return axis
+
+def compute_ordered_reference_frame_from_body(body):
+    vertices = extract_unique_vertices_mm_from_body(body)
+    if len(vertices) < 4:
+        return None
+
+    center = centroid_from_vertices_mm(vertices)
+    C = covariance_matrix_from_vertices_mm(vertices, center)
+    pairs = jacobi_eigen_3x3_symmetric(C)
+
+    eig_x = pairs[0][0]
+    eig_y = pairs[1][0]
+    eig_z = pairs[2][0]
+
+    x = vector_normalize(pairs[0][1])
+    y = vector_normalize(pairs[1][1])
+    z_from_eigen = vector_normalize(pairs[2][1])
+
+    if x is None or y is None or z_from_eigen is None:
+        return None
+
+    warnings = []
+    x = orient_axis_by_geometry(x, vertices, center, "local X", warnings)
+    y = orient_axis_by_geometry(y, vertices, center, "local Y", warnings)
+
+    dot_xy = vector_dot(y, x)
+    y = vector_sub(y, vector_scale(x, dot_xy))
+    y = vector_normalize(y)
+    if y is None:
+        return None
+
+    z = vector_cross(x, y)
+    z = vector_normalize(z)
+    if z is None:
+        return None
+
+    if vector_dot(z, z_from_eigen) < 0.0:
+        y = vector_scale(y, -1.0)
+        z = vector_cross(x, y)
+        z = vector_normalize(z)
+
+    ratio_xy = safe_div(eig_x, eig_y)
+    ratio_yz = safe_div(eig_y, eig_z)
+    axis_quality = "OK"
+
+    if ratio_xy is not None and ratio_xy < AXIS_AMBIGUITY_RATIO:
+        warnings.append("local X/Y axes may be ambiguous")
+        axis_quality = "WARNING"
+
+    if ratio_yz is not None and ratio_yz < AXIS_AMBIGUITY_RATIO:
+        warnings.append("local Y/Z axes may be ambiguous")
+        axis_quality = "WARNING"
+
+    if len(warnings) > 0 and axis_quality == "OK":
+        axis_quality = "WARNING"
+
+    return {
+        "center": center,
+        "x": x,
+        "y": y,
+        "z": z,
+        "eig_x": eig_x,
+        "eig_y": eig_y,
+        "eig_z": eig_z,
+        "ratio_xy": ratio_xy,
+        "ratio_yz": ratio_yz,
+        "axis_quality": axis_quality,
+        "warning": " | ".join(warnings),
+        "vertex_count": len(vertices)
+    }
+
+
+def frame_from_database_row(row):
+    center = (
+        safe_float(row.get("ref_center_x_mm")),
+        safe_float(row.get("ref_center_y_mm")),
+        safe_float(row.get("ref_center_z_mm"))
+    )
+    x = [safe_float(row.get("local_x_dir_x")), safe_float(row.get("local_x_dir_y")), safe_float(row.get("local_x_dir_z"))]
+    y = [safe_float(row.get("local_y_dir_x")), safe_float(row.get("local_y_dir_y")), safe_float(row.get("local_y_dir_z"))]
+    z = [safe_float(row.get("local_z_dir_x")), safe_float(row.get("local_z_dir_y")), safe_float(row.get("local_z_dir_z"))]
+
+    if center[0] is None or center[1] is None or center[2] is None:
+        return None
+    if None in x or None in y or None in z:
+        return None
+
+    return {"center": center, "x": x, "y": y, "z": z, "axis_quality": row.get("axis_quality", ""), "warning": row.get("ref_warning", "")}
+
+# ============================================================
+# DATUM PLANES FOR VISUAL DEBUG / FUTURE PLANE-BASED POSITIONING
+# ============================================================
+
+def to_spaceclaim_point_from_mm(p):
+    return Point.Create(p[0] / 1000.0, p[1] / 1000.0, p[2] / 1000.0)
+
+def to_spaceclaim_direction(v):
+    return Direction.Create(v[0], v[1], v[2])
+
+def create_datum_plane_from_axes(origin_mm, dir1_vec, dir2_vec, name):
+    origin = to_spaceclaim_point_from_mm(origin_mm)
+    dir1 = to_spaceclaim_direction(dir1_vec)
+    dir2 = to_spaceclaim_direction(dir2_vec)
+    frame = Frame.Create(origin, dir1, dir2)
+    plane = Plane.Create(frame)
+    result = DatumPlaneCreator.Create(plane, None)
+    plane_created = list(result.GetCreated[DatumPlane]())[0]
+
+    try:
+        plane_created.SetName(name)
+    except:
+        try:
+            plane_created.Name = name
+        except:
+            pass
+
+    return plane_created
+
+def create_temporary_target_planes(body, frame_data, index):
+    if not CREATE_TARGET_REFERENCE_PLANES:
+        return []
+
+    body_name = make_safe_name(get_name(body))
+    prefix = "TMP_MATCH_{:03d}_{}".format(index, body_name)
+    planes = []
+
+    try:
+        planes.append(create_datum_plane_from_axes(frame_data["center"], frame_data["y"], frame_data["z"], prefix + "_YZ"))
+        planes.append(create_datum_plane_from_axes(frame_data["center"], frame_data["x"], frame_data["z"], prefix + "_XZ"))
+        planes.append(create_datum_plane_from_axes(frame_data["center"], frame_data["x"], frame_data["y"], prefix + "_XY"))
+        print("Temporary target planes created for {}".format(get_name(body)))
+    except Exception as e:
+        print("Could not create temporary target planes for {}: {}".format(get_name(body), e))
+
+    return planes
+
+def delete_temporary_planes(planes):
+    if not DELETE_TARGET_REFERENCE_PLANES_AFTER:
+        return
+    for p in planes:
+        delete_item(p)
+
+# ============================================================
+# UNIQUE IMPORT HELPERS
+# ============================================================
+
+def make_target_instance_label(target_sig, target_plan_id):
+    """
+    Builds a short occurrence-level label for logs and final replacement names.
+
+    Important:
+    body_name alone is not reliable because several occurrences may share the
+    same name/master. The plan id is unique and the center helps auditing.
+    """
+    try:
+        base = make_safe_name(target_sig.get("body_name", "TARGET"))
+        cx = format_float3(target_sig.get("center_x_mm", ""))
+        cy = format_float3(target_sig.get("center_y_mm", ""))
+        cz = format_float3(target_sig.get("center_z_mm", ""))
+
+        # Keep it short enough for the tree.
+        return "{}_{}_C{}_{}_{}".format(base, safe_str(target_plan_id), cx, cy, cz)
+    except:
+        return "TARGET_{}".format(safe_str(target_plan_id))
+
+def make_unique_temp_import_file(db_file_path, db_row, target_plan_id):
+    """
+    Copies the database .scdocx to a unique temporary filename before importing.
+
+    Why:
+    In SpaceClaim/Discovery, inserting the same .scdocx many times can reuse a
+    dependent component definition. Then moving the newly inserted body can also
+    affect previously inserted replacements. A unique file path per occurrence
+    forces the import to behave as an independent set.
+
+    Returns:
+        path_to_insert, path_source_label
+    """
+    if not USE_UNIQUE_TEMP_IMPORT_COPY_PER_PLAN:
+        return db_file_path, "original_database_file"
+
+    if db_file_path is None or safe_str(db_file_path) == "":
+        return db_file_path, "empty_database_file_path"
+
+    if not os.path.exists(db_file_path):
+        return db_file_path, "missing_original_database_file"
+
+    try:
+        if not os.path.exists(UNIQUE_TEMP_IMPORT_FOLDER):
+            os.makedirs(UNIQUE_TEMP_IMPORT_FOLDER)
+    except:
+        pass
+
+    db_key = safe_str(db_row.get("file_key", "DB"))
+    if db_key == "":
+        db_key = safe_str(db_row.get("body_name", "DB"))
+
+    db_key = make_safe_name(db_key)
+    plan_key = make_safe_name(target_plan_id)
+
+    ext = os.path.splitext(db_file_path)[1]
+    if ext == "":
+        ext = ".scdocx"
+
+    unique_name = "{}_{}{}".format(db_key, plan_key, ext)
+    unique_path = os.path.join(UNIQUE_TEMP_IMPORT_FOLDER, unique_name)
+
+    try:
+        shutil.copy2(db_file_path, unique_path)
+        return unique_path, "unique_temp_copy_from_database_file"
+    except Exception as e:
+        print("Could not create unique import copy. Falling back to original file: {}".format(e))
+        return db_file_path, "unique_temp_copy_failed_fallback_original"
+
+def cleanup_unique_temp_import_file(unique_path, db_file_path):
+    """
+    Optional cleanup. Default is False because some SpaceClaim sessions may keep
+    a relation to the inserted file during the current session.
+    """
+    if not DELETE_UNIQUE_TEMP_IMPORT_FILES_AFTER_INSERT:
+        return
+
+    try:
+        if unique_path and unique_path != db_file_path and os.path.exists(unique_path):
+            os.remove(unique_path)
+    except Exception as e:
+        print("Could not delete temporary import file {}: {}".format(unique_path, e))
+
+# ============================================================
+# IMPORT DATABASE ITEM
+# ============================================================
+
+def get_all_bodies():
+    try:
+        return list(GetRootPart().GetAllBodies())
+    except:
+        return []
+
+def body_in_list(body, bodies):
+    for b in bodies:
+        try:
+            if b == body:
+                return True
+        except:
+            pass
+    return False
+
+# ============================================================
+# IMPORT SNAPSHOT ISOLATION
+# ============================================================
+#
+
+def round_key_value(value, ndigits):
+    try:
+        if value is None:
+            return ""
+        return str(round(float(value), ndigits))
+    except:
+        return safe_str(value)
+
+def body_snapshot_token(body):
+    """
+    Stable-enough token for detecting bodies that already existed before import.
+
+    It intentionally combines:
+        - name
+        - ExportIdentifier if available
+        - center rounded in mm
+        - AABB rounded in mm
+        - face/edge counts
+
+    This avoids relying only on object identity, which can be unstable after
+    DocumentInsert/InsertFile in SpaceClaim.
+    """
+    try:
+        sig = build_body_signature(body)
+
+        parts = [
+            make_safe_name(get_name(body)),
+            get_export_identifier(body),
+            round_key_value(sig.get("center_x_mm"), 3),
+            round_key_value(sig.get("center_y_mm"), 3),
+            round_key_value(sig.get("center_z_mm"), 3),
+            round_key_value(sig.get("aabb_min_mm"), 3),
+            round_key_value(sig.get("aabb_mid_mm"), 3),
+            round_key_value(sig.get("aabb_max_mm"), 3),
+            safe_str(sig.get("num_faces", "")),
+            safe_str(sig.get("num_edges", "")),
+            safe_str(sig.get("num_planar_faces", "")),
+            safe_str(sig.get("num_cylindrical_faces", ""))
+        ]
+
+        return "|".join(parts)
+
+    except:
+        # Fallback is still better than direct object comparison.
+        try:
+            return make_safe_name(get_name(body)) + "|" + safe_str(body.GetHashCode())
+        except:
+            return make_safe_name(get_name(body)) + "|" + safe_str(id(body))
+
+def make_body_snapshot_tokens(bodies):
+    tokens = {}
+    for b in bodies:
+        try:
+            token = body_snapshot_token(b)
+            if token != "":
+                tokens[token] = True
+        except:
+            pass
+    return tokens
+
+def is_macro_generated_body_name(name):
+    """
+    Bodies created by the macro in previous plans must never be selected as fresh
+    imported database bodies for the next plan.
+    """
+    n = safe_str(name).upper()
+
+    prefixes = [
+        "DB_REPLACEMENT_",
+        "DB_SOURCE_ORIGINAL_",
+        "DB_LINKED_IMPORT_",
+        "REPLACED_BY_DB_",
+        "TMP_MATCH_"
+    ]
+
+    for p in prefixes:
+        if n.startswith(p):
+            return True
+
+    return False
+
+def filter_fresh_imported_bodies_after_insert(before_snapshot_tokens):
+    after_bodies = get_all_bodies()
+    fresh = []
+    rejected_old_or_macro = 0
+
+    for b in after_bodies:
+        try:
+            name = get_name(b)
+
+            # Never consider previous macro products as imported bodies for this plan.
+            if is_macro_generated_body_name(name):
+                rejected_old_or_macro += 1
+                continue
+
+            token = body_snapshot_token(b)
+
+            if token not in before_snapshot_tokens:
+                fresh.append(b)
+        except:
+            pass
+
+    return fresh, rejected_old_or_macro
+
+def add_body_unique_by_identity(body, bodies, keys):
+    if body is None:
+        return
+
+    key = ""
+    try:
+        key = safe_str(get_export_identifier(body))
+    except:
+        key = ""
+
+    if key == "":
+        try:
+            key = safe_str(body.GetHashCode())
+        except:
+            key = ""
+
+    if key == "":
+        try:
+            key = safe_str(id(body))
+        except:
+            key = safe_str(body)
+
+    if key != "" and key not in keys:
+        keys[key] = True
+        bodies.append(body)
+
+
+def collect_bodies_from_component_like(obj, bodies, keys):
+    if obj is None:
+        return
+
+    # Direct component methods.
+    try:
+        for b in obj.GetAllBodies():
+            add_body_unique_by_identity(b, bodies, keys)
+    except:
+        pass
+
+    try:
+        for b in obj.GetBodies():
+            add_body_unique_by_identity(b, bodies, keys)
+    except:
+        pass
+
+    # Common SpaceClaim component Content tree.
+    try:
+        content = obj.Content
+        try:
+            for b in content.Bodies:
+                add_body_unique_by_identity(b, bodies, keys)
+        except:
+            pass
+        try:
+            for b in content.GetAllBodies():
+                add_body_unique_by_identity(b, bodies, keys)
+        except:
+            pass
+    except:
+        pass
+
+    # Child components recursion.
+    try:
+        for child in obj.Components:
+            collect_bodies_from_component_like(child, bodies, keys)
+    except:
+        pass
+
+LAST_INSERT_CREATED_COMPONENTS = []
+LAST_INSERT_COMPONENT_DETAIL = ""
+
+def add_object_unique_by_identity(obj, objects, keys):
+    if obj is None:
+        return
+
+    key = ""
+    try:
+        key = safe_str(get_export_identifier(obj))
+    except:
+        key = ""
+
+    if key == "":
+        try:
+            key = safe_str(obj.GetHashCode())
+        except:
+            key = ""
+
+    if key == "":
+        try:
+            key = safe_str(id(obj))
+        except:
+            key = safe_str(obj)
+
+    if key != "" and key not in keys:
+        keys[key] = True
+        objects.append(obj)
+
+
+def collect_components_recursive(obj, components, keys):
+    if obj is None:
+        return
+
+    try:
+        for c in obj.GetAllComponents():
+            add_object_unique_by_identity(c, components, keys)
+    except:
+        pass
+
+    try:
+        for c in obj.Components:
+            add_object_unique_by_identity(c, components, keys)
+            collect_components_recursive(c, components, keys)
+    except:
+        pass
+
+    try:
+        content = obj.Content
+        try:
+            for c in content.Components:
+                add_object_unique_by_identity(c, components, keys)
+                collect_components_recursive(c, components, keys)
+        except:
+            pass
+    except:
+        pass
+
+
+def get_all_components_safe():
+    components = []
+    keys = {}
+
+    try:
+        root = GetRootPart()
+        collect_components_recursive(root, components, keys)
+    except:
+        pass
+
+    return components
+
+
+def make_object_key_dict(objects):
+    keys = {}
+    for obj in objects:
+        try:
+            key = ""
+            try:
+                key = safe_str(get_export_identifier(obj))
+            except:
+                key = ""
+            if key == "":
+                try:
+                    key = safe_str(obj.GetHashCode())
+                except:
+                    key = ""
+            if key == "":
+                try:
+                    key = safe_str(id(obj))
+                except:
+                    key = safe_str(obj)
+            if key != "":
+                keys[key] = True
+        except:
+            pass
+    return keys
+
+
+def filter_fresh_components_after_insert(before_component_keys):
+    fresh = []
+    keys = {}
+    try:
+        for c in get_all_components_safe():
+            key = ""
+            try:
+                key = safe_str(get_export_identifier(c))
+            except:
+                key = ""
+            if key == "":
+                try:
+                    key = safe_str(c.GetHashCode())
+                except:
+                    key = ""
+            if key == "":
+                try:
+                    key = safe_str(id(c))
+                except:
+                    key = safe_str(c)
+            if key != "" and key not in before_component_keys:
+                add_object_unique_by_identity(c, fresh, keys)
+    except:
+        pass
+    return fresh
+
+def get_created_bodies_from_insert_result(result):
+    global LAST_INSERT_CREATED_COMPONENTS
+
+    bodies = []
+    keys = {}
+    LAST_INSERT_CREATED_COMPONENTS = []
+
+    if result is None:
+        return bodies
+
+    # Most useful path: GetCreated[DesignBody]().
+    try:
+        for b in result.GetCreated[DesignBody]():
+            add_body_unique_by_identity(b, bodies, keys)
+    except:
+        pass
+
+    # Other possible properties depending on SpaceClaim/Discovery build.
+    for attr in ["CreatedBodies", "Bodies", "CreatedDesignBodies"]:
+        try:
+            values = getattr(result, attr)
+            if values is not None:
+                for b in values:
+                    add_body_unique_by_identity(b, bodies, keys)
+        except:
+            pass
+
+    # Created components may contain the bodies.
+    created_components = []
+
+    try:
+        for c in result.GetCreated[Component]():
+            created_components.append(c)
+    except:
+        pass
+
+    for attr in ["CreatedComponents", "Components"]:
+        try:
+            values = getattr(result, attr)
+            if values is not None:
+                for c in values:
+                    created_components.append(c)
+        except:
+            pass
+
+    component_keys = {}
+    for c in created_components:
+        add_object_unique_by_identity(c, LAST_INSERT_CREATED_COMPONENTS, component_keys)
+        collect_bodies_from_component_like(c, bodies, keys)
+
+    # Final filter: result-created bodies still must not be previous macro products.
+    clean = []
+    clean_keys = {}
+    for b in bodies:
+        try:
+            if is_macro_generated_body_name(get_name(b)):
+                continue
+            add_body_unique_by_identity(b, clean, clean_keys)
+        except:
+            pass
+
+    return clean
+
+
+def insert_database_file_into_current_document(file_path):
+    global LAST_INSERT_CREATED_COMPONENTS
+    global LAST_INSERT_COMPONENT_DETAIL
+
+    LAST_INSERT_CREATED_COMPONENTS = []
+    LAST_INSERT_COMPONENT_DETAIL = ""
+
+    before_bodies = get_all_bodies()
+    before_snapshot_tokens = make_body_snapshot_tokens(before_bodies)
+    before_component_keys = make_object_key_dict(get_all_components_safe())
+
+    if not os.path.exists(file_path):
+        raise Exception("Database item file does not exist: " + file_path)
+
+    last_error = ""
+
+    def after_insert_result(method_name, result_obj=None):
+        global LAST_INSERT_CREATED_COMPONENTS
+        global LAST_INSERT_COMPONENT_DETAIL
+
+        result_bodies = []
+        if PREFER_IMPORT_RESULT_CREATED_BODIES:
+            result_bodies = get_created_bodies_from_insert_result(result_obj)
+
+        if len(LAST_INSERT_CREATED_COMPONENTS) == 0:
+            fresh_components = filter_fresh_components_after_insert(before_component_keys)
+            LAST_INSERT_CREATED_COMPONENTS = fresh_components
+            LAST_INSERT_COMPONENT_DETAIL = "snapshot_fresh_components={}".format(len(fresh_components))
+        else:
+            LAST_INSERT_COMPONENT_DETAIL = "result_created_components={}".format(len(LAST_INSERT_CREATED_COMPONENTS))
+
+        if len(result_bodies) > 0:
+            detail = "{} | result_created_bodies={} | {} | snapshot_fallback_used=0".format(
+                method_name,
+                len(result_bodies),
+                LAST_INSERT_COMPONENT_DETAIL
+            )
+            append_full_txt_log("IMPORT_RESULT", detail)
+            return result_bodies, detail
+
+        fresh, rejected_old_or_macro = filter_fresh_imported_bodies_after_insert(before_snapshot_tokens)
+        detail = "{} | result_created_bodies=0 | snapshot_fresh_bodies={} | rejected_old_or_macro={} | {} | snapshot_fallback_used=1".format(
+            method_name,
+            len(fresh),
+            rejected_old_or_macro,
+            LAST_INSERT_COMPONENT_DETAIL
+        )
+        append_full_txt_log("IMPORT_RESULT", detail)
+        return fresh, detail
+
+    # Candidate 1: common SpaceClaim insert command name.
+    try:
+        options = ImportOptions.Create()
+        result = DocumentInsert.Execute(file_path, options)
+        return after_insert_result("DocumentInsert.Execute(file, ImportOptions)", result)
+    except Exception as e:
+        last_error = safe_str(e)
+
+    # Candidate 2: same command without options.
+    try:
+        result = DocumentInsert.Execute(file_path)
+        return after_insert_result("DocumentInsert.Execute(file)", result)
+    except Exception as e:
+        last_error = safe_str(e)
+
+    # Candidate 3: some versions expose InsertFile.
+    try:
+        options = ImportOptions.Create()
+        result = InsertFile.Execute(file_path, options)
+        return after_insert_result("InsertFile.Execute(file, ImportOptions)", result)
+    except Exception as e:
+        last_error = safe_str(e)
+
+    # Candidate 4: no options.
+    try:
+        result = InsertFile.Execute(file_path)
+        return after_insert_result("InsertFile.Execute(file)", result)
+    except Exception as e:
+        last_error = safe_str(e)
+
+    raise Exception("Could not insert database item file. Last API error: " + last_error)
+
+
+def imported_candidate_allowed(body):
+    """
+    V8: imported candidate must be one of the fresh bodies detected after this import,
+    and must not be a product from a previous replacement plan.
+    """
+    try:
+        name = get_name(body)
+        if is_macro_generated_body_name(name):
+            return False
+        return True
+    except:
+        return False
+
+def choose_imported_original_body(new_bodies, db_row):
+    wanted = safe_str(db_row.get("body_name", ""))
+    best = None
+
+    for b in new_bodies:
+        if not imported_candidate_allowed(b):
+            continue
+
+        sig = build_body_signature(b)
+
+        if sig.get("body_role_guess") != "original_solid":
+            continue
+
+        name = get_name(b)
+
+        # Exact wanted name wins.
+        if wanted != "" and name == wanted:
+            return b
+
+        # Otherwise first fresh original solid.
+        if best is None:
+            best = b
+
+    return best
+
+def choose_imported_treated_surface_body(new_bodies, db_row):
+    wanted = safe_str(db_row.get("paired_treated_surface_body_name", ""))
+    best = None
+    fallback_surface_like = None
+
+    for b in new_bodies:
+        if not imported_candidate_allowed(b):
+            continue
+
+        sig = build_body_signature(b)
+        name = get_name(b)
+        role = sig.get("body_role_guess")
+
+        if role == "treated_surface":
+            if wanted != "" and name == wanted:
+                return b
+            if best is None:
+                best = b
+
+        # Keep a fallback, but only among this plan's fresh imported bodies.
+        try:
+            vol = safe_float(sig.get("body_volume_mm3"), 1.0)
+            aabb_min = safe_float(sig.get("aabb_min_mm"), 999999.0)
+            if vol == 0.0 or aabb_min <= SURFACE_AABB_MIN_EPS_MM:
+                if fallback_surface_like is None:
+                    fallback_surface_like = b
+        except:
+            pass
+
+    if best is not None:
+        return best
+
+    return fallback_surface_like
+
+# ============================================================
+# ORIENTATION SIGN RESOLUTION BY VERTEX CLOUD
+# ============================================================
+
+def reduce_points_for_orientation(points):
+    if points is None:
+        return []
+
+    count = len(points)
+    if count <= VERTEX_CLOUD_MAX_POINTS:
+        return points
+
+    step = int(math.ceil(float(count) / float(VERTEX_CLOUD_MAX_POINTS)))
+    if step < 1:
+        step = 1
+
+    reduced = []
+    i = 0
+    while i < count:
+        reduced.append(points[i])
+        i += step
+
+    return reduced
+
+def frame_with_target_signs(frame, sx_sign, sy_sign, sz_sign):
+    return {
+        "center": frame.get("center"),
+        "x": vector_scale(frame.get("x"), sx_sign),
+        "y": vector_scale(frame.get("y"), sy_sign),
+        "z": vector_scale(frame.get("z"), sz_sign),
+        "axis_quality": frame.get("axis_quality", ""),
+        "warning": frame.get("warning", "")
+    }
+
+def clone_frame(frame):
+    if frame is None:
+        return None
+
+    c = frame.get("center")
+    x = frame.get("x")
+    y = frame.get("y")
+    z = frame.get("z")
+
+    if c is None or x is None or y is None or z is None:
+        return None
+
+    return {
+        "center": [c[0], c[1], c[2]],
+        "x": [x[0], x[1], x[2]],
+        "y": [y[0], y[1], y[2]],
+        "z": [z[0], z[1], z[2]],
+        "axis_quality": frame.get("axis_quality", ""),
+        "warning": frame.get("warning", "")
+    }
+
+def local_coordinates_in_frame(point_mm, frame):
+    c = frame.get("center")
+    x = vector_normalize(frame.get("x"))
+    y = vector_normalize(frame.get("y"))
+    z = vector_normalize(frame.get("z"))
+
+    if c is None or x is None or y is None or z is None:
+        return None
+
+    r = [point_mm[0] - c[0], point_mm[1] - c[1], point_mm[2] - c[2]]
+
+    return [
+        vector_dot(r, x),
+        vector_dot(r, y),
+        vector_dot(r, z)
+    ]
+
+def point_from_local_coordinates(local_xyz, frame):
+    c = frame.get("center")
+    x = vector_normalize(frame.get("x"))
+    y = vector_normalize(frame.get("y"))
+    z = vector_normalize(frame.get("z"))
+
+    if c is None or x is None or y is None or z is None:
+        return None
+
+    p = [c[0], c[1], c[2]]
+    p = vector_add(p, vector_scale(x, local_xyz[0]))
+    p = vector_add(p, vector_scale(y, local_xyz[1]))
+    p = vector_add(p, vector_scale(z, local_xyz[2]))
+
+    return p
+
+def distance_sq_mm(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    dz = a[2] - b[2]
+    return dx * dx + dy * dy + dz * dz
+
+def nearest_distance_sq_to_cloud(point_mm, target_points_mm):
+    best = None
+
+    for p in target_points_mm:
+        d2 = distance_sq_mm(point_mm, p)
+        if best is None or d2 < best:
+            best = d2
+    if best is None:
+        return 999999999999.0
+
+    return best
+
+def vertex_cloud_orientation_score(source_points_mm, target_points_mm, source_frame, target_frame_candidate):
+    """
+    Scores how well the imported dirty solid vertex cloud maps onto the target dirty solid.
+
+    Lower is better.
+    This is used only to choose PCA axis signs, not to decide geometric matching.
+    """
+    if source_points_mm is None or target_points_mm is None:
+        return 999999.0, 999999.0
+
+    if len(source_points_mm) == 0 or len(target_points_mm) == 0:
+        return 999999.0, 999999.0
+
+    total = 0.0
+    max_dist = 0.0
+    count = 0
+
+    for sp in source_points_mm:
+        local = local_coordinates_in_frame(sp, source_frame)
+        if local is None:
+            continue
+
+        mapped = point_from_local_coordinates(local, target_frame_candidate)
+        if mapped is None:
+            continue
+
+        d2 = nearest_distance_sq_to_cloud(mapped, target_points_mm)
+        d = math.sqrt(d2)
+
+        total += d
+        if d > max_dist:
+            max_dist = d
+
+        count += 1
+
+    if count == 0:
+        return 999999.0, 999999.0
+
+    return total / float(count), max_dist
+
+
+def frame_from_target_axis_variant(target_frame, permutation, signs):
+    """
+    Builds a target frame variant by reusing the same target center but changing
+    the local axis order/signs. This is used only to resolve orientation
+    ambiguity; it does not modify any reference plane in the database.
+    """
+    try:
+        base = [
+            vector_normalize(target_frame.get("x")),
+            vector_normalize(target_frame.get("y")),
+            vector_normalize(target_frame.get("z"))
+        ]
+
+        if base[0] is None or base[1] is None or base[2] is None:
+            return None
+
+        x = vector_scale(base[permutation[0]], signs[0])
+        y = vector_scale(base[permutation[1]], signs[1])
+        z = vector_scale(base[permutation[2]], signs[2])
+
+        # Keep only right-handed frames. If z is opposite to x cross y, reject.
+        z_check = vector_cross(x, y)
+        z_check = vector_normalize(z_check)
+        z = vector_normalize(z)
+
+        if z_check is None or z is None:
+            return None
+
+        if vector_dot(z_check, z) < 0.999:
+            return None
+
+        return {
+            "center": target_frame.get("center"),
+            "x": x,
+            "y": y,
+            "z": z,
+            "axis_quality": target_frame.get("axis_quality", ""),
+            "warning": target_frame.get("warning", "")
+        }
+    except:
+        return None
+
+def generate_right_handed_target_frame_variants(target_frame):
+
+    variants = []
+    permutations = [
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0)
+    ]
+
+    sign_values = [-1.0, 1.0]
+
+    for perm in permutations:
+        for sx in sign_values:
+            for sy in sign_values:
+                for sz in sign_values:
+                    signs = (sx, sy, sz)
+                    frame = frame_from_target_axis_variant(target_frame, perm, signs)
+                    if frame is None:
+                        continue
+
+                    label = "perm{}{}{}_sign{:+.0f}{:+.0f}{:+.0f}".format(
+                        perm[0], perm[1], perm[2], sx, sy, sz
+                    )
+                    variants.append((label, frame))
+
+    if len(variants) == 0:
+        variants.append(("original_frame", target_frame))
+
+    return variants
+
+def choose_best_target_frame_variant_by_vertex_cloud(source_original_body, target_body, source_frame, target_frame):
+    """
+    Chooses the best target-frame orientation using source/target dirty-solid
+    vertex clouds.
+
+    improvement:
+        - sign flips are not enough for asymmetric plates/brackets;
+        - the local X/Y/Z order may also be ambiguous;
+        - this function tests all right-handed permutations/signs of the target
+          frame and selects the one with the lowest vertex-cloud distance.
+
+    This does NOT modify the database template or its reference planes. It only
+    changes the target frame used for transforming the copied replacement body.
+    """
+    result = {
+        "frame": target_frame,
+        "signs": "original_frame",
+        "mean_score": "",
+        "max_score": "",
+        "warning": ""
+    }
+
+    if not USE_VERTEX_CLOUD_SIGN_RESOLUTION:
+        return result
+
+    if source_original_body is None or target_body is None:
+        result["warning"] = "orientation resolution skipped: missing source or target original body"
+        return result
+
+    source_points = extract_unique_vertices_mm_from_body(source_original_body)
+    target_points = extract_unique_vertices_mm_from_body(target_body)
+
+    source_points = reduce_points_for_orientation(source_points)
+    target_points = reduce_points_for_orientation(target_points)
+
+    if len(source_points) == 0 or len(target_points) == 0:
+        result["warning"] = "orientation resolution skipped: empty vertex cloud"
+        return result
+
+    if USE_VERTEX_CLOUD_AXIS_PERMUTATION_RESOLUTION:
+        frame_candidates = generate_right_handed_target_frame_variants(target_frame)
+    else:
+        frame_candidates = [
+            ("+X,+Y,+Z", frame_with_target_signs(target_frame, 1.0, 1.0, 1.0)),
+            ("+X,-Y,-Z", frame_with_target_signs(target_frame, 1.0, -1.0, -1.0)),
+            ("-X,+Y,-Z", frame_with_target_signs(target_frame, -1.0, 1.0, -1.0)),
+            ("-X,-Y,+Z", frame_with_target_signs(target_frame, -1.0, -1.0, 1.0))
+        ]
+
+    best_frame = None
+    best_label = ""
+    best_mean = None
+    best_max = None
+
+    for label, candidate_frame in frame_candidates:
+        if candidate_frame is None:
+            continue
+
+        mean_score, max_score = vertex_cloud_orientation_score(
+            source_points,
+            target_points,
+            source_frame,
+            candidate_frame
+        )
+
+        if best_mean is None or mean_score < best_mean:
+            best_mean = mean_score
+            best_max = max_score
+            best_frame = candidate_frame
+            best_label = label
+
+    if best_frame is not None:
+        result["frame"] = best_frame
+        result["signs"] = best_label
+        result["mean_score"] = best_mean
+        result["max_score"] = best_max
+
+        if best_mean is not None and best_mean > VERTEX_CLOUD_WARNING_SCORE_MM:
+            result["warning"] = "high orientation vertex-cloud score"
+
+    return result
+
+
+def choose_best_target_frame_variant_by_planned_target_points(source_original_body, target_points_mm, source_frame, target_frame):
+    """
+    Uses the target dirty-solid vertex cloud captured during planning instead of
+    reading target_body during execution. This avoids orientation fallback/empty
+    vertex-cloud cases after SpaceClaim refreshes or invalidates wrappers for
+    repeated component instances.
+    """
+    result = {
+        "frame": target_frame,
+        "signs": "original_frame",
+        "mean_score": "",
+        "max_score": "",
+        "warning": ""
+    }
+
+    if not USE_VERTEX_CLOUD_SIGN_RESOLUTION:
+        return result
+
+    if source_original_body is None:
+        result["warning"] = "orientation resolution skipped: missing source original body"
+        return result
+
+    if target_points_mm is None or len(target_points_mm) == 0:
+        result["warning"] = "orientation resolution skipped: empty planned target vertex cloud"
+        return result
+
+    source_points = extract_unique_vertices_mm_from_body(source_original_body)
+    source_points = reduce_points_for_orientation(source_points)
+    target_points = reduce_points_for_orientation(list(target_points_mm))
+
+    if len(source_points) == 0 or len(target_points) == 0:
+        result["warning"] = "orientation resolution skipped: empty vertex cloud"
+        return result
+
+    if USE_VERTEX_CLOUD_AXIS_PERMUTATION_RESOLUTION:
+        frame_candidates = generate_right_handed_target_frame_variants(target_frame)
+    else:
+        frame_candidates = [
+            ("+X,+Y,+Z", frame_with_target_signs(target_frame, 1.0, 1.0, 1.0)),
+            ("+X,-Y,-Z", frame_with_target_signs(target_frame, 1.0, -1.0, -1.0)),
+            ("-X,+Y,-Z", frame_with_target_signs(target_frame, -1.0, 1.0, -1.0)),
+            ("-X,-Y,+Z", frame_with_target_signs(target_frame, -1.0, -1.0, 1.0))
+        ]
+
+    best_frame = None
+    best_label = ""
+    best_mean = None
+    best_max = None
+
+    for label, candidate_frame in frame_candidates:
+        if candidate_frame is None:
+            continue
+
+        mean_score, max_score = vertex_cloud_orientation_score(
+            source_points,
+            target_points,
+            source_frame,
+            candidate_frame
+        )
+
+        if best_mean is None or mean_score < best_mean:
+            best_mean = mean_score
+            best_max = max_score
+            best_frame = candidate_frame
+            best_label = label
+
+    if best_frame is not None:
+        result["frame"] = best_frame
+        result["signs"] = best_label
+        result["mean_score"] = best_mean
+        result["max_score"] = best_max
+
+        if best_mean is not None and best_mean > VERTEX_CLOUD_WARNING_SCORE_MM:
+            result["warning"] = "high orientation vertex-cloud score"
+
+    return result
+
+# ============================================================
+# TRANSFORM / ALIGNMENT
+# ============================================================
+
+def rotate_vector(v, axis, angle):
+    axis = vector_normalize(axis)
+    if axis is None:
+        return v
+
+    c = math.cos(angle)
+    s = math.sin(angle)
+    term1 = vector_scale(v, c)
+    term2 = vector_scale(vector_cross(axis, v), s)
+    term3 = vector_scale(axis, vector_dot(axis, v) * (1.0 - c))
+    return vector_add(vector_add(term1, term2), term3)
+
+def choose_perpendicular_axis(v):
+    v = vector_normalize(v)
+    if v is None:
+        return [1.0, 0.0, 0.0]
+
+    candidates = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    best = None
+    best_norm = None
+
+    for c in candidates:
+        cr = vector_cross(v, c)
+        n = vector_norm(cr)
+        if best is None or n > best_norm:
+            best = cr
+            best_norm = n
+
+    best = vector_normalize(best)
+    if best is None:
+        return [1.0, 0.0, 0.0]
+    return best
+
+def angle_between_vectors(a, b):
+    a = vector_normalize(a)
+    b = vector_normalize(b)
+    if a is None or b is None:
+        return 0.0
+    d = clamp(vector_dot(a, b), -1.0, 1.0)
+    return math.acos(d)
+
+def signed_angle_about_axis(a, b, axis):
+    a = vector_normalize(a)
+    b = vector_normalize(b)
+    axis = vector_normalize(axis)
+    if a is None or b is None or axis is None:
+        return 0.0
+
+    angle = angle_between_vectors(a, b)
+    cr = vector_cross(a, b)
+    if vector_dot(cr, axis) < 0.0:
+        angle = -angle
+    return angle
+
+def move_translate_body_mm(body, delta_mm):
+    dx = delta_mm[0] / 1000.0
+    dy = delta_mm[1] / 1000.0
+    dz = delta_mm[2] / 1000.0
+    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    if dist < TRANSLATION_TOL_M:
+        return True
+
+    direction = Direction.Create(dx / dist, dy / dist, dz / dist)
+    selection = Selection.Create(body)
+    options = MoveOptions()
+    options.MaintainOrientation = True
+    Move.Translate(selection, direction, dist, options)
+    return True
+
+def move_rotate_body_about_axis(body, origin_mm, axis_vec, angle_rad):
+    if abs(angle_rad) < ANGLE_TOL_RAD:
+        return True
+
+    axis_vec = vector_normalize(axis_vec)
+    if axis_vec is None:
+        return False
+
+    origin = to_spaceclaim_point_from_mm(origin_mm)
+    direction = to_spaceclaim_direction(axis_vec)
+    axis_line = Line.Create(origin, direction)
+
+    selection = Selection.Create(body)
+    options = MoveOptions()
+    options.MaintainOrientation = True
+
+    # In SpaceClaim scripts, angles are normally in radians internally.
+    Move.Rotate(selection, axis_line, angle_rad, options)
+    return True
+
+def move_translate_items_mm(items, delta_mm):
+    dx = delta_mm[0] / 1000.0
+    dy = delta_mm[1] / 1000.0
+    dz = delta_mm[2] / 1000.0
+    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    if dist < TRANSLATION_TOL_M:
+        return True
+
+    direction = Direction.Create(dx / dist, dy / dist, dz / dist)
+    options = MoveOptions()
+    options.MaintainOrientation = True
+
+    for item in items:
+        try:
+            Move.Translate(Selection.Create(item), direction, dist, options)
+        except Exception as e:
+            print("Could not translate imported item {}: {}".format(get_name(item), e))
+            return False
+
+    return True
+
+def move_rotate_items_about_axis(items, origin_mm, axis_vec, angle_rad):
+    if abs(angle_rad) < ANGLE_TOL_RAD:
+        return True
+
+    axis_vec = vector_normalize(axis_vec)
+    if axis_vec is None:
+        return False
+
+    origin = to_spaceclaim_point_from_mm(origin_mm)
+    direction = to_spaceclaim_direction(axis_vec)
+    axis_line = Line.Create(origin, direction)
+    options = MoveOptions()
+    options.MaintainOrientation = True
+
+    for item in items:
+        try:
+            Move.Rotate(Selection.Create(item), axis_line, angle_rad, options)
+        except Exception as e:
+            print("Could not rotate imported item {}: {}".format(get_name(item), e))
+            return False
+    return True
+
+def get_valid_transform_items(items):
+    result = []
+    for item in items:
+        try:
+            if item is None:
+                continue
+            # Accessing the name is a light sanity check for stale wrappers.
+            get_name(item)
+            result.append(item)
+        except:
+            pass
+    return result
+
+def project_onto_plane(v, normal):
+    normal = vector_normalize(normal)
+    if normal is None:
+        return None
+    return vector_sub(v, vector_scale(normal, vector_dot(v, normal)))
+
+def align_items_to_target_frame(items, source_frame, target_frame):
+    if source_frame is None or target_frame is None:
+        raise Exception("source_frame or target_frame is None")
+
+    items = get_valid_transform_items(items)
+    if len(items) == 0:
+        raise Exception("No imported items available for rigid transformation")
+
+    source_center = source_frame["center"]
+    sx = vector_normalize(source_frame["x"])
+    sy = vector_normalize(source_frame["y"])
+    sz = vector_normalize(source_frame["z"])
+
+    tx = vector_normalize(target_frame["x"])
+    ty = vector_normalize(target_frame["y"])
+    tz = vector_normalize(target_frame["z"])
+
+    if sx is None or sy is None or sz is None or tx is None or ty is None or tz is None:
+        raise Exception("Invalid source or target axes")
+
+    rotation_1_rad = 0.0
+    rotation_2_rad = 0.0
+
+    # Step 1: rotate source X to target X.
+    axis1 = vector_cross(sx, tx)
+    n1 = vector_norm(axis1)
+    dot_x = clamp(vector_dot(sx, tx), -1.0, 1.0)
+
+    if n1 < 1e-10:
+        if dot_x < 0.0:
+            axis1 = choose_perpendicular_axis(sx)
+            angle1 = math.pi
+        else:
+            axis1 = [1.0, 0.0, 0.0]
+            angle1 = 0.0
+    else:
+        axis1 = vector_scale(axis1, 1.0 / n1)
+        angle1 = math.acos(dot_x)
+
+    rotation_1_rad = angle1
+
+    if abs(angle1) >= ANGLE_TOL_RAD:
+        if TRANSFORM_ALL_IMPORTED_BODIES_AS_RIGID_SET:
+            move_rotate_items_about_axis(items, source_center, axis1, angle1)
+        else:
+            move_rotate_items_about_axis([items[0]], source_center, axis1, angle1)
+        sx = rotate_vector(sx, axis1, angle1)
+        sy = rotate_vector(sy, axis1, angle1)
+        sz = rotate_vector(sz, axis1, angle1)
+
+    # Step 2: rotate around target X to align local Y.
+    sy_proj = project_onto_plane(sy, tx)
+    ty_proj = project_onto_plane(ty, tx)
+
+    if sy_proj is not None and ty_proj is not None:
+        sy_proj = vector_normalize(sy_proj)
+        ty_proj = vector_normalize(ty_proj)
+        if sy_proj is not None and ty_proj is not None:
+            angle2 = signed_angle_about_axis(sy_proj, ty_proj, tx)
+            rotation_2_rad = angle2
+            if abs(angle2) >= ANGLE_TOL_RAD:
+                if TRANSFORM_ALL_IMPORTED_BODIES_AS_RIGID_SET:
+                    move_rotate_items_about_axis(items, source_center, tx, angle2)
+                else:
+                    move_rotate_items_about_axis([items[0]], source_center, tx, angle2)
+                sy = rotate_vector(sy, tx, angle2)
+                sz = rotate_vector(sz, tx, angle2)
+
+    # Step 3: translate source center to target center.
+    target_center = target_frame["center"]
+    delta_mm = [
+        target_center[0] - source_center[0],
+        target_center[1] - source_center[1],
+        target_center[2] - source_center[2]
+    ]
+
+    if TRANSFORM_ALL_IMPORTED_BODIES_AS_RIGID_SET:
+        move_translate_items_mm(items, delta_mm)
+    else:
+        move_translate_items_mm([items[0]], delta_mm)
+
+    return {
+        "items_transformed": len(items),
+        "delta_x_mm": delta_mm[0],
+        "delta_y_mm": delta_mm[1],
+        "delta_z_mm": delta_mm[2],
+        "rotation_1_rad": rotation_1_rad,
+        "rotation_2_rad": rotation_2_rad
+    }
+
+def align_body_to_target_frame(body, source_frame, target_frame):
+    # Backward-compatible wrapper. New V4 workflow should call align_items_to_target_frame.
+    return align_items_to_target_frame([body], source_frame, target_frame)
+
+# ============================================================
+# DIAGNOSTIC HELPERS
+# ============================================================
+
+DIAGNOSTIC_EVENT_COUNTER = 0
+
+def trim_debug_text(text_value):
+    try:
+        txt = safe_str(text_value)
+        limit = int(DEBUG_MAX_DETAIL_TEXT_LENGTH)
+        if limit > 0 and len(txt) > limit:
+            return txt[:limit] + " ...[truncated]"
+        return txt
+    except:
+        return safe_str(text_value)
+
+def get_export_identifier(obj):
+    try:
+        return safe_str(obj.ExportIdentifier)
+    except:
+        return ""
+
+def format_float3(value):
+    try:
+        if value is None:
+            return ""
+        return "{:.3f}".format(float(value))
+    except:
+        return safe_str(value)
+
+def format_vector3(v):
+    try:
+        if v is None:
+            return ""
+        return "({:.3f}, {:.3f}, {:.3f})".format(float(v[0]), float(v[1]), float(v[2]))
+    except:
+        return safe_str(v)
+
+def body_center_tuple_mm(body):
+    try:
+        return get_center_mm(body)
+    except:
+        return None, None, None
+
+def body_summary_for_debug(body):
+    try:
+        if body is None:
+            return "None"
+
+        sig = None
+        try:
+            sig = build_body_signature(body)
+        except:
+            sig = {}
+
+        cx, cy, cz = body_center_tuple_mm(body)
+
+        return "name={} | id={} | role={} | faces={} | edges={} | center=({},{},{}) | aabb=({},{},{})".format(
+            get_name(body),
+            get_export_identifier(body),
+            safe_str(sig.get("body_role_guess", "")),
+            safe_str(sig.get("num_faces", "")),
+            safe_str(sig.get("num_edges", "")),
+            format_float3(cx),
+            format_float3(cy),
+            format_float3(cz),
+            format_float3(sig.get("aabb_min_mm", "")),
+            format_float3(sig.get("aabb_mid_mm", "")),
+            format_float3(sig.get("aabb_max_mm", ""))
+        )
+    except Exception as e:
+        return "body_summary_failed: {}".format(safe_str(e))
+
+def bodies_summary_for_debug(bodies):
+    try:
+        parts = []
+        index = 0
+        for body in bodies:
+            index += 1
+            parts.append("[{}] {}".format(index, body_summary_for_debug(body)))
+        return " || ".join(parts)
+    except Exception as e:
+        return "bodies_summary_failed: {}".format(safe_str(e))
+
+def frame_summary_for_debug(frame):
+    try:
+        if frame is None:
+            return "None"
+        return "center={} | x={} | y={} | z={} | quality={} | warning={}".format(
+            format_vector3(frame.get("center")),
+            format_vector3(frame.get("x")),
+            format_vector3(frame.get("y")),
+            format_vector3(frame.get("z")),
+            safe_str(frame.get("axis_quality", "")),
+            safe_str(frame.get("warning", ""))
+        )
+    except Exception as e:
+        return "frame_summary_failed: {}".format(safe_str(e))
+
+def center_error_between_body_and_target_frame(body, target_frame):
+    try:
+        if body is None or target_frame is None:
+            return ""
+        cx, cy, cz = body_center_tuple_mm(body)
+        tc = target_frame.get("center")
+        if cx is None or cy is None or cz is None or tc is None:
+            return ""
+        dx = cx - tc[0]
+        dy = cy - tc[1]
+        dz = cz - tc[2]
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+    except:
+        return ""
+
+def make_plan_diagnostic_row(candidate_index, plan_id, status, reason, target_sig, db_row, score, metrics, counters):
+    if target_sig is None:
+        target_sig = {}
+    if db_row is None:
+        db_row = {}
+    if metrics is None:
+        metrics = {}
+    if counters is None:
+        counters = {}
+
+    return {
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "candidate_index": candidate_index,
+        "plan_id": plan_id,
+        "status": status,
+        "reason": reason,
+        "target_body_name": target_sig.get("body_name", ""),
+        "target_role": target_sig.get("body_role_guess", ""),
+        "target_center_x_mm": target_sig.get("center_x_mm", ""),
+        "target_center_y_mm": target_sig.get("center_y_mm", ""),
+        "target_center_z_mm": target_sig.get("center_z_mm", ""),
+        "target_aabb_min_mm": target_sig.get("aabb_min_mm", ""),
+        "target_aabb_mid_mm": target_sig.get("aabb_mid_mm", ""),
+        "target_aabb_max_mm": target_sig.get("aabb_max_mm", ""),
+        "target_volume_mm3": target_sig.get("body_volume_mm3", ""),
+        "target_area_mm2": target_sig.get("body_surface_area_mm2", ""),
+        "target_faces": target_sig.get("num_faces", ""),
+        "target_edges": target_sig.get("num_edges", ""),
+        "db_file_key": db_row.get("file_key", ""),
+        "db_body_name": db_row.get("body_name", ""),
+        "db_pair_id": db_row.get("pair_id", ""),
+        "score": score,
+        "e_aabb_abs_max": metrics.get("e_aabb_abs_max", ""),
+        "e_aabb_rel": metrics.get("e_aabb_rel", ""),
+        "e_volume": metrics.get("e_volume", ""),
+        "e_area": metrics.get("e_area", ""),
+        "e_inertia_mean": metrics.get("e_inertia_mean", ""),
+        "e_topology": metrics.get("e_topology", ""),
+        "count_total_db": counters.get("count_total_db", ""),
+        "count_pass_aabb": counters.get("count_pass_aabb", ""),
+        "count_pass_aabb_relaxed": counters.get("count_pass_aabb_relaxed", ""),
+        "count_pass_volume": counters.get("count_pass_volume", ""),
+        "count_pass_area": counters.get("count_pass_area", ""),
+        "count_pass_inertia": counters.get("count_pass_inertia", ""),
+        "count_pass_topology": counters.get("count_pass_topology", ""),
+        "count_pass_final": counters.get("count_pass_final", "")
+    }
+
+def append_plan_diagnostic(row):
+    if not ENABLE_DIAGNOSTIC_LOGS:
+        return
+    try:
+        clean = {}
+        for field in DIAGNOSTIC_PLAN_FIELDS:
+            clean[field] = "" if row.get(field, "") is None else row.get(field, "")
+        with open(DIAGNOSTIC_PLAN_LOG_CSV, "a") as f:
+            writer = csv.DictWriter(f, fieldnames=DIAGNOSTIC_PLAN_FIELDS, delimiter=";")
+            writer.writerow(clean)
+    except Exception as e:
+        print("Could not write diagnostic plan log: {}".format(e))
+
+def append_event_diagnostic(row):
+    if not ENABLE_DIAGNOSTIC_LOGS:
+        return
+    try:
+        clean = {}
+        for field in DIAGNOSTIC_EVENT_FIELDS:
+            clean[field] = "" if row.get(field, "") is None else row.get(field, "")
+        with open(DIAGNOSTIC_EVENT_LOG_CSV, "a") as f:
+            writer = csv.DictWriter(f, fieldnames=DIAGNOSTIC_EVENT_FIELDS, delimiter=";")
+            writer.writerow(clean)
+    except Exception as e:
+        print("Could not write diagnostic event log: {}".format(e))
+
+def debug_event(phase, plan_id="", target_body=None, target_sig=None, db_row=None, body=None, frame=None, message="", details=""):
+    global DIAGNOSTIC_EVENT_COUNTER
+
+    try:
+        DIAGNOSTIC_EVENT_COUNTER += 1
+
+        if target_sig is None:
+            target_sig = {}
+        if db_row is None:
+            db_row = {}
+
+        cx = cy = cz = ""
+        body_name = ""
+        body_id = ""
+        body_role = ""
+
+        if body is not None:
+            body_name = get_name(body)
+            body_id = get_export_identifier(body)
+            try:
+                bsig = build_body_signature(body)
+                body_role = bsig.get("body_role_guess", "")
+            except:
+                body_role = ""
+            cx, cy, cz = body_center_tuple_mm(body)
+
+        row = {
+            "event_index": DIAGNOSTIC_EVENT_COUNTER,
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "phase": phase,
+            "plan_id": plan_id,
+            "target_body_name": target_sig.get("body_name", ""),
+            "target_export_id": get_export_identifier(target_body),
+            "db_file_key": db_row.get("file_key", ""),
+            "db_body_name": db_row.get("body_name", ""),
+            "db_pair_id": db_row.get("pair_id", ""),
+            "body_name": body_name,
+            "body_export_id": body_id,
+            "body_role": body_role,
+            "body_center_x_mm": cx,
+            "body_center_y_mm": cy,
+            "body_center_z_mm": cz,
+            "frame_summary": frame_summary_for_debug(frame),
+            "message": trim_debug_text(message),
+            "details": trim_debug_text(details)
+        }
+
+        if ENABLE_FULL_TXT_LOG:
+            append_full_txt_log_row(row)
+
+        if ENABLE_DIAGNOSTIC_LOGS:
+            append_event_diagnostic(row)
+
+        if DEBUG_VERBOSE_CONSOLE:
+            print("[DEBUG {}] plan={} target={} db={} body={} | {}".format(
+                phase,
+                plan_id,
+                target_sig.get("body_name", ""),
+                db_row.get("file_key", ""),
+                body_name,
+                message
+            ))
+
+    except Exception as e:
+        print("debug_event failed: {}".format(e))
+        append_full_txt_log_exception("DEBUG_EVENT_FAILED", e)
+
+
+def init_diagnostic_logs():
+    if not ENABLE_DIAGNOSTIC_LOGS:
+        return
+
+    try:
+        ensure_folder_for_file(DIAGNOSTIC_EVENT_LOG_CSV)
+        with open(DIAGNOSTIC_EVENT_LOG_CSV, "w") as f:
+            writer = csv.DictWriter(f, fieldnames=DIAGNOSTIC_EVENT_FIELDS, delimiter=";")
+            writer.writeheader()
+    except Exception as e:
+        print("Could not initialize diagnostic event log: {}".format(e))
+
+    try:
+        ensure_folder_for_file(DIAGNOSTIC_PLAN_LOG_CSV)
+        with open(DIAGNOSTIC_PLAN_LOG_CSV, "w") as f:
+            writer = csv.DictWriter(f, fieldnames=DIAGNOSTIC_PLAN_FIELDS, delimiter=";")
+            writer.writeheader()
+    except Exception as e:
+        print("Could not initialize diagnostic plan log: {}".format(e))
+
+DIAGNOSTIC_EVENT_FIELDS = [
+    "event_index",
+    "datetime",
+    "phase",
+    "plan_id",
+    "target_body_name",
+    "target_export_id",
+    "db_file_key",
+    "db_body_name",
+    "db_pair_id",
+    "body_name",
+    "body_export_id",
+    "body_role",
+    "body_center_x_mm",
+    "body_center_y_mm",
+    "body_center_z_mm",
+    "frame_summary",
+    "message",
+    "details"
+]
+
+
+DIAGNOSTIC_PLAN_FIELDS = [
+    "datetime",
+    "candidate_index",
+    "plan_id",
+    "status",
+    "reason",
+    "target_body_name",
+    "target_role",
+    "target_center_x_mm",
+    "target_center_y_mm",
+    "target_center_z_mm",
+    "target_aabb_min_mm",
+    "target_aabb_mid_mm",
+    "target_aabb_max_mm",
+    "target_volume_mm3",
+    "target_area_mm2",
+    "target_faces",
+    "target_edges",
+    "db_file_key",
+    "db_body_name",
+    "db_pair_id",
+    "score",
+    "e_aabb_abs_max",
+    "e_aabb_rel",
+    "e_volume",
+    "e_area",
+    "e_inertia_mean",
+    "e_topology",
+    "count_total_db",
+    "count_pass_aabb",
+    "count_pass_aabb_relaxed",
+    "count_pass_volume",
+    "count_pass_area",
+    "count_pass_inertia",
+    "count_pass_topology",
+    "count_pass_final"
+]
+
+# ============================================================
+# LOG
+# ============================================================
+
+LOG_FIELDS = [
+    "datetime",
+    "target_body_name",
+    "target_action",
+    "accepted",
+    "replaced",
+    "score",
+    "db_file_key",
+    "db_body_name",
+    "db_pair_id",
+    "db_item_file_path",
+    "db_item_file_path_source",
+    "replacement_body_name",
+    "import_method",
+    "new_bodies_count",
+    "transformed_items_count",
+    "transform_delta_x_mm",
+    "transform_delta_y_mm",
+    "transform_delta_z_mm",
+    "transform_rotation_1_rad",
+    "transform_rotation_2_rad",
+    "target_plan_id",
+    "target_center_x_mm",
+    "target_center_y_mm",
+    "target_center_z_mm",
+    "source_frame_source",
+    "source_original_body_name",
+    "target_axis_quality",
+    "target_ref_warning",
+    "orientation_signs",
+    "orientation_score_mean_mm",
+    "orientation_score_max_mm",
+    "orientation_warning",
+    "baked_copy_created",
+    "baked_replacement_body_name",
+    "imported_set_after_bake_action",
+    "individual_instance_mode",
+    "error_message"
+]
+
+def init_log():
+    ensure_folder_for_file(REPLACEMENT_LOG_CSV)
+    with open(REPLACEMENT_LOG_CSV, "w") as f:
+        writer = csv.DictWriter(f, fieldnames=LOG_FIELDS, delimiter=";")
+        writer.writeheader()
+
+def append_log(row):
+    clean = {}
+    for field in LOG_FIELDS:
+        value = row.get(field, "")
+        clean[field] = "" if value is None else value
+
+    with open(REPLACEMENT_LOG_CSV, "a") as f:
+        writer = csv.DictWriter(f, fieldnames=LOG_FIELDS, delimiter=";")
+        writer.writerow(clean)
+
+# ============================================================
+# REPLACEMENT WORKFLOW
+# ============================================================
+
+def get_body_component_path(body):
+    names = []
+
+    current = body
+    visited = {}
+
+    for i in range(20):
+        if current is None:
+            break
+
+        try:
+            key = safe_str(id(current))
+            if key in visited:
+                break
+            visited[key] = True
+        except:
+            pass
+
+        try:
+            name = get_name(current)
+            if name != "":
+                names.append(name)
+        except:
+            pass
+
+        parent = None
+
+        for attr in ["Parent", "Component", "Master"]:
+            try:
+                parent = getattr(current, attr)
+                if parent is not None:
+                    break
+            except:
+                parent = None
+
+        if parent is None:
+            try:
+                parent = current.GetParent()
+            except:
+                parent = None
+
+        current = parent
+
+    return "/".join(names)
+
+def path_contains_database_key(path_text):
+    if not SKIP_DATABASE_COMPONENT_PATH_MATCHES:
+        return False
+
+    p = safe_str(path_text).upper()
+    if p == "":
+        return False
+    for key in DATABASE_FILE_KEYS:
+        if key != "" and key in p:
+            return True
+    for key in DATABASE_BODY_NAMES:
+        if key != "" and key in p:
+            return True
+
+    return False
+
+def should_skip_target_body(body, body_name):
+    if SKIP_ALREADY_REPLACED and starts_with_any(body_name, ["REPLACED_BY_DB_"]):
+        return True
+    if SKIP_IMPORTED_REPLACEMENT_BODIES and starts_with_any(body_name, ["DB_REPLACEMENT_", "DB_IMPORTED_", "DB_TEMPLATE_", "DB_SOURCE_ORIGINAL_"]):
+        return True
+    if is_macro_generated_body_name(body_name):
+        return True
+    if SKIP_EXISTING_DATABASE_ITEM_BODIES:
+        component_path = get_body_component_path(body)
+        if path_contains_database_key(component_path):
+            if not CURRENT_SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS:
+                return True
+            else:
+                append_full_txt_log(
+                    "SECOND_PASS_DATABASE_PATH_CANDIDATE_ALLOWED",
+                    "body={} | component_path={}".format(body_name, component_path)
+                )
+
+        name_upper = safe_str(body_name).upper()
+
+        if name_upper in DATABASE_BODY_NAMES:
+            if not CURRENT_SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS:
+                return True
+            else:
+                append_full_txt_log(
+                    "SECOND_PASS_DATABASE_NAME_CANDIDATE_ALLOWED",
+                    "body={} | name_upper={}".format(body_name, name_upper)
+                )
+    return False
+
+def get_bodies_from_paste_result(paste_result, before_bodies):
+    """
+    V11: Returns bodies created by Paste.FromClipboard().
+
+    The V10 failure was: Paste.FromClipboard returned something, but no pasted body
+    was detected. In some SpaceClaim builds the pasted object is exposed through
+    GetCreated[DesignBody](), CreatedBodies, CreatedComponents, or only by a
+    refreshed document snapshot. This function tries all paths.
+    """
+    bodies = []
+    keys = {}
+
+    before_tokens = {}
+    try:
+        before_tokens = make_body_snapshot_tokens(before_bodies)
+    except:
+        before_tokens = {}
+
+    def add_body(b):
+        try:
+            if b is None:
+                return
+            add_body_unique_by_identity(b, bodies, keys)
+        except:
+            pass
+
+    # Direct GetCreated paths.
+    try:
+        for b in paste_result.GetCreated[DesignBody]():
+            add_body(b)
+    except:
+        pass
+
+    try:
+        for b in paste_result.GetCreated[IDesignBody]():
+            add_body(b)
+    except:
+        pass
+
+    # Common properties.
+    for attr in ["CreatedBodies", "Bodies", "CreatedDesignBodies"]:
+        try:
+            values = getattr(paste_result, attr)
+            if values is not None:
+                for b in values:
+                    add_body(b)
+        except:
+            pass
+
+    # CreatedObjects selection path.
+    try:
+        created = paste_result.CreatedObjects
+        try:
+            sel = Selection.Create(created)
+            try:
+                for b in list(sel.GetItems[DesignBody]()):
+                    add_body(b)
+            except:
+                pass
+            try:
+                for b in list(sel.GetItems[IDesignBody]()):
+                    add_body(b)
+            except:
+                pass
+        except:
+            pass
+    except:
+        pass
+
+    # Created components may contain bodies.
+    created_components = []
+    try:
+        for c in paste_result.GetCreated[Component]():
+            created_components.append(c)
+    except:
+        pass
+
+    for attr in ["CreatedComponents", "Components"]:
+        try:
+            values = getattr(paste_result, attr)
+            if values is not None:
+                for c in values:
+                    created_components.append(c)
+        except:
+            pass
+
+    for c in created_components:
+        collect_bodies_from_component_like(c, bodies, keys)
+
+    # Snapshot fallback by robust token, not wrapper identity.
+    try:
+        after_bodies = get_all_bodies()
+        for b in after_bodies:
+            try:
+                token = body_snapshot_token(b)
+                if token in before_tokens:
+                    continue
+                add_body(b)
+            except:
+                pass
+    except:
+        pass
+
+    return bodies
+
+def show_item_for_copy(item):
+    try:
+        selection = Selection.Create(item)
+        ViewHelper.SetObjectVisibility(selection, VisibilityType.Show, False)
+        return True
+    except:
+        return False
+
+def copy_body_in_place_as_independent(body):
+
+    if body is None:
+        return None, "source body is None"
+
+    if FORCE_TEMPLATE_VISIBLE_BEFORE_COPY:
+        show_item_for_copy(body)
+
+    before_bodies = get_all_bodies()
+    errors = []
+
+    # Method 1: clipboard API used in V10.
+    try:
+        result = Copy.ToClipboard(Selection.Create(body))
+        try:
+            if hasattr(result, "Success") and not result.Success:
+                errors.append("Copy.ToClipboard Success=False")
+        except:
+            pass
+
+        paste_result = Paste.FromClipboard()
+        if paste_result is None:
+            errors.append("Paste.FromClipboard returned None")
+        else:
+            created_bodies = get_bodies_from_paste_result(paste_result, before_bodies)
+            if len(created_bodies) > 0:
+                best = choose_best_copied_body(created_bodies)
+                return best, ""
+            errors.append("clipboard paste created no detected bodies")
+    except Exception as e:
+        errors.append("clipboard copy/paste failed: " + safe_str(e))
+
+    # Method 2: some SpaceClaim builds expose Copy.Execute.
+    try:
+        before_bodies = get_all_bodies()
+        result = Copy.Execute(Selection.Create(body))
+        created_bodies = get_bodies_from_paste_result(result, before_bodies)
+        if len(created_bodies) > 0:
+            best = choose_best_copied_body(created_bodies)
+            return best, ""
+        errors.append("Copy.Execute created no detected bodies")
+    except Exception as e:
+        errors.append("Copy.Execute failed: " + safe_str(e))
+
+    return None, " | ".join(errors)
+
+def choose_best_copied_body(created_bodies):
+    best = None
+    for b in created_bodies:
+        try:
+            sig = build_body_signature(b)
+            if sig.get("body_role_guess") == "treated_surface":
+                best = b
+                break
+        except:
+            pass
+    if best is None and len(created_bodies) > 0:
+        best = created_bodies[0]
+    return best
+
+def cleanup_linked_imported_set_after_bake(new_bodies, db_row=None, target_sig=None):
+    """
+    Removes or hides the linked imported database set after the independent final copy exists.
+    This prevents later imports of the same database file from moving previous replacements.
+    """
+    action = safe_str(IMPORTED_SET_AFTER_BAKE_ACTION).upper()
+
+    if action == "":
+        action = "DELETE"
+
+    for b in new_bodies:
+        try:
+            old_name = get_name(b)
+            db_key = "DB"
+            target_name = "TARGET"
+
+            if db_row is not None:
+                db_key = safe_str(db_row.get("file_key", "DB"))
+            if target_sig is not None:
+                target_name = make_safe_name(target_sig.get("body_name", "TARGET"))
+
+            set_name(b, "DB_LINKED_IMPORT_{}_FOR_{}_{}".format(db_key, target_name, old_name))
+        except:
+            pass
+
+        if action == "DELETE":
+            delete_item(b)
+        elif action == "HIDE":
+            hide_item(b)
+        else:
+            pass
+
+def cleanup_imported_non_replacement_bodies(new_bodies, replacement_body, db_row=None, target_sig=None):
+    """
+    Handles imported support bodies, normally the dirty original solid that comes with the bank file.
+
+    V3 default is HIDE, not DELETE. Deleting the source original can affect dependent imports
+    of the same database item in the same SpaceClaim session and break the next positioning.
+    """
+    action = safe_str(IMPORTED_NON_REPLACEMENT_BODY_ACTION).upper()
+
+    for b in new_bodies:
+        try:
+            if b == replacement_body:
+                continue
+        except:
+            pass
+
+        try:
+            old_name = get_name(b)
+            db_key = "DB"
+            target_name = "TARGET"
+
+            if db_row is not None:
+                db_key = safe_str(db_row.get("file_key", "DB"))
+            if target_sig is not None:
+                # Use a compact instance label if present; avoids name collision when many
+                # occurrences have the same original body name.
+                target_name = make_target_instance_label(target_sig, "SRC")
+
+            set_name(b, "DB_SOURCE_ORIGINAL_{}_FOR_{}_{}".format(db_key, target_name, old_name))
+        except:
+            pass
+
+        if action == "HIDE":
+            hide_item(b)
+        elif action == "DELETE":
+            # Kept as an option, but not recommended during industrial validation.
+            delete_item(b)
+        else:
+            pass
+
+def apply_original_after_replacement_action(target_body, db_row):
+    action = safe_str(ORIGINAL_AFTER_REPLACEMENT).upper()
+    if action == "":
+        action = "KEEP"
+
+    # V16: never mutate the original structural body unless explicitly unlocked.
+    # This is important for assemblies with repeated/component instances, because
+    # deleting one occurrence can delete or invalidate sibling occurrences.
+    if action in ["DELETE", "HIDE"] and not ALLOW_ORIGINAL_TARGET_DELETE_OR_HIDE:
+        append_full_txt_log(
+            "ORIGINAL_TARGET_ACTION_FORCED_KEEP",
+            "requested_action={} | target={} | db_key={}".format(
+                action,
+                body_summary_for_debug(target_body),
+                safe_str(db_row.get("file_key", "DB"))
+            )
+        )
+        return "KEEP"
+
+    if TAG_TARGET_ORIGINAL_BODY:
+        old_name = get_name(target_body)
+        new_name = "REPLACED_BY_DB_{}_{}".format(safe_str(db_row.get("file_key", "DB")), old_name)
+        set_name(target_body, new_name)
+
+    if action == "HIDE":
+        hide_item(target_body)
+        return "HIDE"
+
+    if action == "DELETE":
+        delete_item(target_body)
+        return "DELETE"
+
+    return "KEEP"
+
+def replace_one_target_body(target_body, target_sig, db_row, score, match_index, target_frame_snapshot=None, target_plan_id=""):
+    db_file_path, path_source = resolve_database_item_file_path(db_row)
+    temp_planes = []
+
+    log_row = {
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "target_body_name": target_sig.get("body_name"),
+        "target_action": "",
+        "accepted": 1,
+        "replaced": 0,
+        "score": score,
+        "db_file_key": db_row.get("file_key", ""),
+        "db_body_name": db_row.get("body_name", ""),
+        "db_pair_id": db_row.get("pair_id", ""),
+        "db_item_file_path": db_file_path,
+        "db_item_file_path_source": path_source,
+        "replacement_body_name": "",
+        "import_method": "",
+        "new_bodies_count": "",
+        "transformed_items_count": "",
+        "transform_delta_x_mm": "",
+        "transform_delta_y_mm": "",
+        "transform_delta_z_mm": "",
+        "transform_rotation_1_rad": "",
+        "transform_rotation_2_rad": "",
+        "target_plan_id": target_plan_id,
+        "target_center_x_mm": "",
+        "target_center_y_mm": "",
+        "target_center_z_mm": "",
+        "source_frame_source": "",
+        "source_original_body_name": "",
+        "target_axis_quality": "",
+        "target_ref_warning": "",
+        "orientation_signs": "",
+        "orientation_score_mean_mm": "",
+        "orientation_score_max_mm": "",
+        "orientation_warning": "",
+        "baked_copy_created": "",
+        "baked_replacement_body_name": "",
+        "imported_set_after_bake_action": "",
+        "individual_instance_mode": "V9_PLANE_FRAME_SOURCE_AND_STRICT_IMPORT",
+        "error_message": ""
+    }
+
+    try:
+        debug_event(
+            "REPLACE_START",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            target_body,
+            target_frame_snapshot,
+            "Starting replacement for planned target",
+            "target={} | db_file_path={} | score={}".format(body_summary_for_debug(target_body), db_file_path, score)
+        )
+
+        # This is the dictionary/snapshot of the original spatial position before imports, hides or renames.
+        target_frame = clone_frame(target_frame_snapshot)
+
+        if target_frame is None:
+            target_frame = compute_ordered_reference_frame_from_body(target_body)
+
+        if target_frame is None:
+            debug_event("TARGET_FRAME_FAILED", target_plan_id, target_body, target_sig, db_row, target_body, None, "Could not compute target frame", "")
+            raise Exception("Could not compute target reference frame")
+
+        debug_event("TARGET_FRAME_OK", target_plan_id, target_body, target_sig, db_row, target_body, target_frame, "Target frame available before import", "")
+
+        log_row["target_axis_quality"] = target_frame.get("axis_quality", "")
+        log_row["target_ref_warning"] = target_frame.get("warning", "")
+
+        c = target_frame.get("center")
+        if c is not None:
+            log_row["target_center_x_mm"] = c[0]
+            log_row["target_center_y_mm"] = c[1]
+            log_row["target_center_z_mm"] = c[2]
+
+        temp_planes = create_temporary_target_planes(target_body, target_frame, match_index)
+
+        if DRY_RUN:
+            print("DRY_RUN: replacement skipped for target {}".format(target_sig.get("body_name")))
+            log_row["target_action"] = "DRY_RUN"
+            append_log(log_row)
+            delete_temporary_planes(temp_planes)
+            return True
+
+        # This is the main positioning fix for repeated database items.
+        import_file_path = db_file_path
+        import_path_source = path_source
+
+        if USE_UNIQUE_TEMP_IMPORT_COPY_PER_PLAN:
+            import_file_path, import_path_source = make_unique_temp_import_file(
+                db_file_path,
+                db_row,
+                target_plan_id
+            )
+
+        log_row["db_item_file_path"] = import_file_path
+        log_row["db_item_file_path_source"] = import_path_source
+
+        debug_event(
+            "IMPORT_START",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            None,
+            None,
+            "Importing database item",
+            "original={} | insert_path={} | source={}".format(db_file_path, import_file_path, import_path_source)
+        )
+
+        new_bodies, import_method = insert_database_file_into_current_document(import_file_path)
+        cleanup_unique_temp_import_file(import_file_path, db_file_path)
+
+        log_row["import_method"] = import_method
+        log_row["new_bodies_count"] = len(new_bodies)
+
+        if DEBUG_LOG_IMPORT_BODY_DETAILS:
+            debug_event("IMPORT_DONE", target_plan_id, target_body, target_sig, db_row, None, None, "Imported database item", "method={} | new_bodies_count={} | bodies={}".format(import_method, len(new_bodies), bodies_summary_for_debug(new_bodies)))
+
+        if len(new_bodies) == 0:
+            raise Exception("No new bodies were detected after database item import")
+
+        replacement_body = choose_imported_treated_surface_body(new_bodies, db_row)
+        if replacement_body is None:
+            debug_event("CHOOSE_REPLACEMENT_FAILED", target_plan_id, target_body, target_sig, db_row, None, None, "Could not identify imported treated_surface body", bodies_summary_for_debug(new_bodies))
+            raise Exception("Could not identify imported treated_surface body")
+
+        imported_original_body = choose_imported_original_body(new_bodies, db_row)
+
+        debug_event("CHOOSE_IMPORTED_BODIES", target_plan_id, target_body, target_sig, db_row, replacement_body, None, "Imported bodies selected", "replacement={} | imported_original={}".format(body_summary_for_debug(replacement_body), body_summary_for_debug(imported_original_body)))
+
+        # This is the plane/frame-based workflow: the frame of the target instance
+        # and the frame of the bank item are created by the same rule/function.
+        # Recomputing the source frame from imported bodies is now only a fallback,
+        # because repeated imports may expose stale/dependent SpaceClaim bodies.
+        source_frame = None
+        source_frame_source = ""
+
+        if ABORT_IF_IMPORTED_SELECTION_IS_OLD_MACRO_BODY:
+            if replacement_body is not None and is_macro_generated_body_name(get_name(replacement_body)):
+                raise Exception("Selected replacement body is an old macro body, not a fresh import: " + get_name(replacement_body))
+            if imported_original_body is not None and is_macro_generated_body_name(get_name(imported_original_body)):
+                raise Exception("Selected original source body is an old macro body, not a fresh import: " + get_name(imported_original_body))
+
+        if USE_DATABASE_ROW_FRAME_AS_SOURCE_FIRST:
+            source_frame = frame_from_database_row(db_row)
+            if source_frame is not None:
+                source_frame_source = "database_row_plane_frame"
+
+        if imported_original_body is not None:
+            log_row["source_original_body_name"] = get_name(imported_original_body)
+
+        if source_frame is None and imported_original_body is not None:
+            source_frame = compute_ordered_reference_frame_from_body(imported_original_body)
+            if source_frame is not None:
+                source_frame_source = "imported_original_body_fallback"
+
+        if source_frame is None:
+            source_frame = compute_ordered_reference_frame_from_body(replacement_body)
+            if source_frame is not None:
+                source_frame_source = "imported_replacement_surface_fallback"
+
+        if source_frame is None:
+            debug_event("SOURCE_FRAME_FAILED", target_plan_id, target_body, target_sig, db_row, imported_original_body, None, "Could not compute source frame", "replacement={}".format(body_summary_for_debug(replacement_body)))
+            raise Exception("Could not compute source reference frame for imported database item")
+
+        debug_event("SOURCE_FRAME_OK", target_plan_id, target_body, target_sig, db_row, imported_original_body, source_frame, "Source frame computed", "source_frame_source={}".format(source_frame_source))
+
+        log_row["source_frame_source"] = source_frame_source
+
+        orientation_result = choose_best_target_frame_variant_by_vertex_cloud(
+            imported_original_body,
+            target_body,
+            source_frame,
+            target_frame
+        )
+
+        target_frame_for_alignment = orientation_result.get("frame", target_frame)
+
+        log_row["orientation_signs"] = orientation_result.get("signs", "")
+        log_row["orientation_score_mean_mm"] = orientation_result.get("mean_score", "")
+        log_row["orientation_score_max_mm"] = orientation_result.get("max_score", "")
+        log_row["orientation_warning"] = orientation_result.get("warning", "")
+
+        debug_event("ORIENTATION_SELECTED", target_plan_id, target_body, target_sig, db_row, replacement_body, target_frame_for_alignment, "Orientation variant selected", "signs={} | mean_score={} | max_score={} | warning={}".format(log_row["orientation_signs"], log_row["orientation_score_mean_mm"], log_row["orientation_score_max_mm"], log_row["orientation_warning"]))
+
+        # The source frame is taken from the imported dirty/original solid whenever possible.
+        # This avoids moving only the treated surface while leaving the imported reference solid behind.
+        transform_items = []
+        if TRANSFORM_ALL_IMPORTED_BODIES_AS_RIGID_SET:
+            transform_items = get_valid_transform_items(new_bodies)
+        else:
+            transform_items = [replacement_body]
+
+        if DEBUG_LOG_TRANSFORM_DETAILS:
+            debug_event("TRANSFORM_BEFORE", target_plan_id, target_body, target_sig, db_row, replacement_body, source_frame, "Before rigid transform", "transform_items={} | replacement_center_error_to_target={} mm".format(bodies_summary_for_debug(transform_items), center_error_between_body_and_target_frame(replacement_body, target_frame_for_alignment)))
+
+        transform_result = align_items_to_target_frame(
+            transform_items,
+            source_frame,
+            target_frame_for_alignment
+        )
+
+        if DEBUG_LOG_TRANSFORM_DETAILS:
+            debug_event("TRANSFORM_AFTER", target_plan_id, target_body, target_sig, db_row, replacement_body, target_frame_for_alignment, "After rigid transform", "transform_result={} | transform_items={} | replacement_center_error_to_target={} mm".format(safe_str(transform_result), bodies_summary_for_debug(transform_items), center_error_between_body_and_target_frame(replacement_body, target_frame_for_alignment)))
+
+        log_row["transformed_items_count"] = transform_result.get("items_transformed", "")
+        log_row["transform_delta_x_mm"] = transform_result.get("delta_x_mm", "")
+        log_row["transform_delta_y_mm"] = transform_result.get("delta_y_mm", "")
+        log_row["transform_delta_z_mm"] = transform_result.get("delta_z_mm", "")
+        log_row["transform_rotation_1_rad"] = transform_result.get("rotation_1_rad", "")
+        log_row["transform_rotation_2_rad"] = transform_result.get("rotation_2_rad", "")
+
+        post_center_error = center_error_between_body_and_target_frame(replacement_body, target_frame_for_alignment)
+        try:
+            if post_center_error != "" and POST_TRANSFORM_CENTER_WARNING_MM > 0.0:
+                if float(post_center_error) > float(POST_TRANSFORM_CENTER_WARNING_MM):
+                    debug_event(
+                        "POST_TRANSFORM_CENTER_WARNING",
+                        target_plan_id,
+                        target_body,
+                        target_sig,
+                        db_row,
+                        replacement_body,
+                        target_frame_for_alignment,
+                        "Replacement center differs from target frame after transform",
+                        "center_error_mm={} | warning_limit_mm={}".format(post_center_error, POST_TRANSFORM_CENTER_WARNING_MM)
+                    )
+            if post_center_error != "" and POST_TRANSFORM_CENTER_ABORT_MM > 0.0:
+                if float(post_center_error) > float(POST_TRANSFORM_CENTER_ABORT_MM):
+                    raise Exception("Post-transform center error above abort limit: {} mm".format(post_center_error))
+        except Exception as center_validation_error:
+            # If abort limit was configured, the raise above should stop execution.
+            if POST_TRANSFORM_CENTER_ABORT_MM > 0.0:
+                raise
+            debug_event("POST_TRANSFORM_CENTER_CHECK_FAILED", target_plan_id, target_body, target_sig, db_row, replacement_body, target_frame_for_alignment, "Center validation failed", safe_str(center_validation_error))
+
+        final_replacement_body = replacement_body
+
+        # Imported database items can behave as dependent components in SpaceClaim.
+        # If we keep moving linked imported bodies, later replacements may drag earlier ones
+        # and produce a pile at one target position. Copy/paste isolates each final surface.
+        if BAKE_POSITIONED_REPLACEMENT_COPY:
+            debug_event("BAKE_START", target_plan_id, target_body, target_sig, db_row, replacement_body, None, "Copying positioned replacement as independent body", body_summary_for_debug(replacement_body))
+
+            baked_body, bake_error = copy_body_in_place_as_independent(replacement_body)
+
+            if baked_body is not None:
+                debug_event("BAKE_DONE", target_plan_id, target_body, target_sig, db_row, baked_body, None, "Independent baked copy created", "baked={} | error={}".format(body_summary_for_debug(baked_body), bake_error))
+                final_replacement_body = baked_body
+                log_row["baked_copy_created"] = 1
+                log_row["baked_replacement_body_name"] = get_name(baked_body)
+                log_row["imported_set_after_bake_action"] = safe_str(IMPORTED_SET_AFTER_BAKE_ACTION).upper()
+
+                debug_event("CLEANUP_LINKED_IMPORT_START", target_plan_id, target_body, target_sig, db_row, None, None, "Cleaning linked imported set after bake", "action={} | bodies={}".format(IMPORTED_SET_AFTER_BAKE_ACTION, bodies_summary_for_debug(new_bodies)))
+                cleanup_linked_imported_set_after_bake(new_bodies, db_row, target_sig)
+                debug_event("CLEANUP_LINKED_IMPORT_DONE", target_plan_id, target_body, target_sig, db_row, None, None, "Linked imported set cleanup finished", "action={}".format(IMPORTED_SET_AFTER_BAKE_ACTION))
+
+            else:
+                debug_event("BAKE_FAILED", target_plan_id, target_body, target_sig, db_row, replacement_body, None, "Independent baked copy failed", bake_error)
+                log_row["baked_copy_created"] = 0
+                log_row["orientation_warning"] = safe_str(log_row.get("orientation_warning", "")) + " | bake independent copy failed: " + safe_str(bake_error)
+
+                if not FALLBACK_TO_LINKED_REPLACEMENT_IF_BAKE_FAILS:
+                    raise Exception("Could not bake independent replacement copy: " + safe_str(bake_error))
+
+                # Fallback: keep the old V4 behavior.
+                final_replacement_body = replacement_body
+                cleanup_imported_non_replacement_bodies(new_bodies, replacement_body, db_row, target_sig)
+
+        else:
+            log_row["baked_copy_created"] = 0
+            cleanup_imported_non_replacement_bodies(new_bodies, replacement_body, db_row, target_sig)
+
+        if TAG_IMPORTED_REPLACEMENT_BODY:
+            target_instance_label = make_target_instance_label(target_sig, target_plan_id)
+            new_name = "DB_REPLACEMENT_{}_AT_{}".format(
+                make_safe_name(safe_str(db_row.get("file_key", "DB"))),
+                target_instance_label
+            )
+            set_name(final_replacement_body, new_name)
+
+        log_row["replacement_body_name"] = get_name(final_replacement_body)
+        if safe_str(log_row.get("baked_replacement_body_name")) == "" and log_row.get("baked_copy_created") == 1:
+            log_row["baked_replacement_body_name"] = get_name(final_replacement_body)
+
+        debug_event("FINAL_REPLACEMENT_READY", target_plan_id, target_body, target_sig, db_row, final_replacement_body, target_frame_for_alignment, "Final replacement body ready before target action", "final_center_error_to_target={} mm".format(center_error_between_body_and_target_frame(final_replacement_body, target_frame_for_alignment)))
+
+        action = apply_original_after_replacement_action(target_body, db_row)
+        log_row["target_action"] = action
+        log_row["replaced"] = 1
+
+        debug_event("TARGET_ACTION_DONE", target_plan_id, target_body, target_sig, db_row, final_replacement_body, None, "Original target action applied", "action={} | replacement={}".format(action, body_summary_for_debug(final_replacement_body)))
+
+        delete_temporary_planes(temp_planes)
+        append_log(log_row)
+        debug_event("REPLACE_SUCCESS", target_plan_id, target_body, target_sig, db_row, final_replacement_body, None, "Replacement finished successfully", "")
+        return True
+
+    except Exception as e:
+        err = safe_str(e)
+        print("Replacement failed for target {}: {}".format(target_sig.get("body_name"), err))
+        debug_event("REPLACE_FAILED", target_plan_id, target_body, target_sig, db_row, None, None, "Replacement failed", err)
+        log_row["error_message"] = err
+        append_log(log_row)
+        delete_temporary_planes(temp_planes)
+        return False
+
+def summarize_plan_by_database_key(plan):
+    counts = {}
+
+    for item in plan:
+        db_row = item.get("db_row")
+        key = safe_str(db_row.get("file_key", ""))
+        if key == "":
+            key = safe_str(db_row.get("body_name", "UNKNOWN_DB"))
+
+        counts[key] = counts.get(key, 0) + 1
+
+    return counts
+
+def print_plan_summary(plan):
+    counts = summarize_plan_by_database_key(plan)
+
+    print("")
+    print("Replacement plan summary:")
+    print("Accepted targets planned: {}".format(len(plan)))
+
+    for key in counts:
+        print("  {} -> {} target(s)".format(key, counts.get(key)))
+
+def existing_replacement_for_target_signature(target_sig, db_row):
+    """
+    When original targets are kept, running the macro twice would otherwise add
+    duplicate DB_REPLACEMENT surfaces. The final replacement name contains the
+    database key and the original target center token, so this check can skip
+    targets that were already treated in a previous run.
+    """
+    if not SKIP_TARGETS_WITH_EXISTING_REPLACEMENT_AT_SAME_CENTER:
+        return False
+
+    try:
+        db_key = make_safe_name(safe_str(db_row.get("file_key", "DB")))
+        cx = format_float3(target_sig.get("center_x_mm", ""))
+        cy = format_float3(target_sig.get("center_y_mm", ""))
+        cz = format_float3(target_sig.get("center_z_mm", ""))
+        center_token = "C{}_{}_{}".format(cx, cy, cz)
+        wanted_prefix = (FINAL_REPLACEMENT_PREFIX + db_key + "_AT_").upper()
+
+        for b in get_all_bodies():
+            try:
+                n = safe_str(get_name(b))
+                nu = n.upper()
+                if nu.startswith(wanted_prefix) and center_token in n:
+                    return True
+            except:
+                pass
+    except:
+        return False
+    return False
+
+
+def build_replacement_plan_from_initial_snapshot(bodies, db_rows):
+    plan = []
+
+    processed = 0
+    accepted_count = 0
+    rejected_count = 0
+    skipped_count = 0
+
+    print("")
+    print("Building replacement plan from initial assembly snapshot...")
+
+    for body in bodies:
+        if PROCESS_ONLY_FIRST_N > 0 and processed >= PROCESS_ONLY_FIRST_N:
+            break
+
+        body_name = get_name(body)
+
+        if should_skip_target_body(body, body_name):
+            skipped_count += 1
+            continue
+
+        if ONLY_VISIBLE_BODIES and not is_visible(body):
+            skipped_count += 1
+            continue
+
+        target_sig = build_body_signature(body)
+
+        if target_sig.get("body_role_guess") != "original_solid":
+            skipped_count += 1
+            continue
+
+        if target_sig.get("aabb_max_mm") is None:
+            skipped_count += 1
+            continue
+
+        if safe_float(target_sig.get("aabb_max_mm"), 0.0) < MIN_AABB_MAX_MM:
+            skipped_count += 1
+            continue
+
+        best, score, metrics, counters = find_best_database_match_precise(target_sig, db_rows)
+        processed += 1
+
+        if DEBUG_VERBOSE_CONSOLE:
+            print("[PLAN DEBUG] candidate={} body={} role={} aabb=({}, {}, {}) faces={} edges={}".format(
+                processed,
+                target_sig.get("body_name"),
+                target_sig.get("body_role_guess"),
+                format_float3(target_sig.get("aabb_min_mm")),
+                format_float3(target_sig.get("aabb_mid_mm")),
+                format_float3(target_sig.get("aabb_max_mm")),
+                target_sig.get("num_faces"),
+                target_sig.get("num_edges")
+            ))
+
+        if best is None or score is None:
+            rejected_count += 1
+            if DEBUG_LOG_REJECTED_CANDIDATES:
+                append_plan_diagnostic(make_plan_diagnostic_row(processed, "", "REJECTED_NO_MATCH", "No database row passed all gates", target_sig, {}, "", {}, counters))
+            continue
+
+        if existing_replacement_for_target_signature(target_sig, best):
+            skipped_count += 1
+            append_full_txt_log(
+                "PLAN_SKIPPED_EXISTING_REPLACEMENT",
+                "target={} | db_key={} | center=({}, {}, {})".format(
+                    target_sig.get("body_name"),
+                    safe_str(best.get("file_key", "DB")),
+                    format_float3(target_sig.get("center_x_mm", "")),
+                    format_float3(target_sig.get("center_y_mm", "")),
+                    format_float3(target_sig.get("center_z_mm", ""))
+                )
+            )
+            continue
+
+        target_frame_snapshot = None
+        target_vertex_cloud_snapshot = []
+
+        if STORE_TARGET_FRAME_IN_PLAN:
+            target_frame_snapshot = compute_ordered_reference_frame_from_body(body)
+            if target_frame_snapshot is None:
+                rejected_count += 1
+                print("Rejected planned match because target frame could not be computed: {}".format(target_sig.get("body_name")))
+                append_plan_diagnostic(make_plan_diagnostic_row(processed, "", "REJECTED_FRAME_FAILED", "Target frame could not be computed", target_sig, best, score, metrics, counters))
+                continue
+
+        if STORE_TARGET_VERTEX_CLOUD_IN_PLAN:
+            target_vertex_cloud_snapshot = reduce_points_for_orientation(extract_unique_vertices_mm_from_body(body))
+
+        accepted_count += 1
+
+        # Color is applied during planning, before any import/replacement changes the model tree.
+        color_body_as_match(body)
+
+        plan_id = "PLAN_{:04d}".format(len(plan) + 1)
+
+        plan.append({
+            "plan_id": plan_id,
+            "body": body,
+            "target_sig": target_sig,
+            "target_frame": target_frame_snapshot,
+            "target_vertex_cloud": target_vertex_cloud_snapshot,
+            "db_row": best,
+            "score": score
+        })
+
+        append_plan_diagnostic(make_plan_diagnostic_row(processed, plan_id, "ACCEPTED", "Planned for replacement", target_sig, best, score, metrics, counters))
+
+        debug_event("PLAN_ACCEPTED", plan_id, body, target_sig, best, body, target_frame_snapshot, "Target planned for replacement", "score={} | metrics={} | counters={}".format(score, safe_str(metrics), safe_str(counters)))
+
+        print("")
+        print("MATCH PLANNED")
+        print("Target: {}".format(target_sig.get("body_name")))
+        print("DB    : {}".format(best.get("body_name")))
+        print("Key   : {}".format(best.get("file_key")))
+        print("Score : {}".format(score))
+        if target_frame_snapshot is not None:
+            c = target_frame_snapshot.get("center")
+            if c is not None:
+                print("Target center mm: {}, {}, {}".format(c[0], c[1], c[2]))
+
+    return plan, processed, accepted_count, rejected_count, skipped_count
+
+# ============================================================
+# TEMPLATE-COPY WORKFLOW
+# ============================================================
+
+def db_template_key(db_row):
+    """
+    Unique logical key for one database item/template.
+    """
+    key = safe_str(db_row.get("file_key", ""))
+    if key == "":
+        key = safe_str(db_row.get("body_name", ""))
+    if key == "":
+        key = safe_str(db_row.get("pair_id", ""))
+    if key == "":
+        key = "DB_ITEM"
+    return make_safe_name(key)
+
+def apply_template_body_action(bodies, db_key):
+    action = safe_str(TEMPLATE_BODY_ACTION_AFTER_IMPORT).upper()
+
+    for b in bodies:
+        try:
+            old_name = get_name(b)
+            if RENAME_TEMPLATE_BODIES_AFTER_IMPORT:
+                if not starts_with_any(old_name, [TEMPLATE_COMPONENT_PREFIX]):
+                    set_name(b, "{}{}_{}".format(TEMPLATE_COMPONENT_PREFIX, db_key, old_name))
+                    append_full_txt_log("TEMPLATE_BODY_RENAMED", "db_key={} | old={} | new={}".format(db_key, old_name, get_name(b)))
+            else:
+                append_full_txt_log("TEMPLATE_BODY_RENAME_SKIPPED", "db_key={} | body={}".format(db_key, old_name))
+        except Exception as e:
+            append_full_txt_log_exception("TEMPLATE_BODY_RENAME_ERROR", e)
+
+        if action == "HIDE":
+            hide_item(b)
+        elif action == "DELETE":
+            # This is intentionally left as the old behavior only when the user
+            # explicitly sets TEMPLATE_BODY_ACTION_AFTER_IMPORT='DELETE'. It is
+            # not recommended for linked .scdocx templates.
+            delete_item(b)
+        else:
+            pass
+
+def object_identity_key(obj):
+    if obj is None:
+        return ""
+
+    try:
+        eid = safe_str(get_export_identifier(obj))
+        if eid != "":
+            return "EXP:" + eid
+    except:
+        pass
+
+    try:
+        key = safe_str(obj.GetHashCode())
+        if key != "":
+            return "HASH:" + key
+    except:
+        pass
+
+    try:
+        return "ID:" + safe_str(id(obj))
+    except:
+        return safe_str(obj)
+
+def add_unique_object(obj, objects, keys):
+    if obj is None:
+        return
+
+    key = object_identity_key(obj)
+    if key == "":
+        return
+    if key not in keys:
+        keys[key] = True
+        objects.append(obj)
+
+def safe_type_name(obj):
+    try:
+        return safe_str(obj.GetType().Name)
+    except:
+        try:
+            return safe_str(type(obj).__name__)
+        except:
+            return ""
+
+def object_summary_for_debug(obj):
+    if obj is None:
+        return "None"
+    try:
+        return "type={} | name={} | key={}".format(
+            safe_type_name(obj),
+            get_name(obj),
+            object_identity_key(obj)
+        )
+    except:
+        return safe_str(obj)
+
+def objects_summary_for_debug(objects):
+    try:
+        parts = []
+        for obj in objects:
+            parts.append(object_summary_for_debug(obj))
+        return " || ".join(parts)
+    except:
+        return ""
+
+def get_template_body_parent_candidates(body):
+    """
+    Returns possible containers/components for a template body.
+    Direct body deletion is what tends to trigger the SpaceClaim prompt asking
+    to save changes in the inserted database item.
+    """
+    candidates = []
+    keys = {}
+
+    current = body
+    depth = 0
+    while current is not None and depth < 6:
+        for attr in ["Parent", "Component"]:
+            try:
+                obj = getattr(current, attr)
+                add_unique_object(obj, candidates, keys)
+            except:
+                pass
+        try:
+            current = current.Parent
+        except:
+            current = None
+        depth += 1
+    try:
+        comp = body.GetAncestor[Component]()
+        add_unique_object(comp, candidates, keys)
+    except:
+        pass
+    return candidates
+
+def get_bodies_from_component_candidate(component_candidate):
+    bodies = []
+    keys = {}
+    try:
+        collect_bodies_from_component_like(component_candidate, bodies, keys)
+    except:
+        pass
+    return bodies
+
+def make_body_key_dict_from_bodies(bodies):
+    keys = {}
+    for b in bodies:
+        try:
+            k = object_identity_key(b)
+            if k != "":
+                keys[k] = True
+        except:
+            pass
+    return keys
+
+def make_body_snapshot_token_dict_from_bodies(bodies):
+
+    tokens = {}
+    for b in bodies:
+        try:
+            token = body_snapshot_token(b)
+            if token != "":
+                tokens[token] = True
+        except:
+            pass
+    return tokens
+
+def component_is_safe_template_container(component_candidate, template_body_keys, template_body_tokens=None):
+
+    comp_bodies = get_bodies_from_component_candidate(component_candidate)
+    if len(comp_bodies) == 0:
+        return False, "no bodies found inside candidate", comp_bodies
+
+    if template_body_tokens is None:
+        template_body_tokens = {}
+
+    matched = 0
+    matched_by_identity = 0
+    matched_by_token = 0
+    foreign = []
+
+    for b in comp_bodies:
+        try:
+            bkey = object_identity_key(b)
+            bname = get_name(b)
+            btoken = ""
+            if TEMPLATE_COMPONENT_SAFETY_USES_BODY_SNAPSHOT_TOKENS:
+                try:
+                    btoken = body_snapshot_token(b)
+                except:
+                    btoken = ""
+
+            if bkey != "" and bkey in template_body_keys:
+                matched += 1
+                matched_by_identity += 1
+                continue
+
+            if btoken != "" and btoken in template_body_tokens:
+                matched += 1
+                matched_by_token += 1
+                continue
+
+            # A final replacement inside the candidate is an automatic rejection.
+            if starts_with_any(bname, [FINAL_REPLACEMENT_PREFIX, "DB_REPLACEMENT_"]):
+                foreign.append("FINAL:" + body_summary_for_debug(b))
+            else:
+                foreign.append(body_summary_for_debug(b))
+        except Exception as e:
+            foreign.append("error evaluating body: " + safe_str(e))
+
+    if matched == 0:
+        return False, "candidate has no cached template bodies by identity or snapshot token", comp_bodies
+
+    if len(foreign) > 0:
+        return False, "candidate has foreign bodies: " + " || ".join(foreign), comp_bodies
+
+    return True, "safe template container with {} body/bodies | matched_identity={} | matched_token={}".format(matched, matched_by_identity, matched_by_token), comp_bodies
+
+def try_direct_delete_object(obj, label):
+
+    attempts = []
+
+    def add_attempt(name, func):
+        attempts.append((name, func))
+
+    add_attempt(
+        "Selection.Create(obj)",
+        lambda: Delete.Execute(Selection.Create(obj))
+    )
+
+    add_attempt(
+        "Selection.Create([obj])",
+        lambda: Delete.Execute(Selection.Create([obj]))
+    )
+
+    for attempt_name, func in attempts:
+        try:
+            append_full_txt_log("DELETE_ATTEMPT", "{} | {} | {}".format(label, attempt_name, object_summary_for_debug(obj)))
+            func()
+            append_full_txt_log("DELETE_OK", "{} | {} | {}".format(label, attempt_name, object_summary_for_debug(obj)))
+            print("Deleted {} {} using {}".format(label, get_name(obj), attempt_name))
+            return True, ""
+        except Exception as e:
+            append_full_txt_log("DELETE_ATTEMPT_FAILED", "{} | {} | {} | error={}".format(label, attempt_name, object_summary_for_debug(obj), safe_str(e)))
+
+    append_full_txt_log("DELETE_FAILED_" + safe_str(label), object_summary_for_debug(obj))
+    return False, "all delete attempts failed"
+
+def cleanup_database_templates_after_workflow(template_cache):
+
+    summary = {
+        "action": safe_str(TEMPLATE_CLEANUP_ACTION_AFTER_WORKFLOW).upper(),
+        "template_bodies": 0,
+        "template_components": 0,
+        "safe_component_candidates": 0,
+        "component_deleted": 0,
+        "body_deleted": 0,
+        "body_hidden": 0,
+        "direct_body_delete_skipped": 0,
+        "failed": 0
+    }
+
+    append_full_txt_log("TEMPLATE_CLEANUP_START", "cache_keys={}".format(len(template_cache)))
+
+    if not CLEANUP_DATABASE_TEMPLATES_AFTER_REPLACEMENT:
+        summary["action"] = "DISABLED"
+        append_full_txt_log("TEMPLATE_CLEANUP_DISABLED", safe_str(summary))
+        return summary
+
+    action = safe_str(TEMPLATE_CLEANUP_ACTION_AFTER_WORKFLOW).upper()
+    if action == "":
+        action = "DELETE"
+    summary["action"] = action
+
+    if action == "KEEP":
+        append_full_txt_log("TEMPLATE_CLEANUP_KEEP", "Templates intentionally kept")
+        return summary
+
+    template_bodies = []
+    template_body_keys = {}
+    template_body_tokens = {}
+    template_components = []
+    template_component_keys = {}
+
+    try:
+        for key in template_cache:
+            info = template_cache.get(key)
+            if info is None:
+                continue
+
+            append_full_txt_log("TEMPLATE_CACHE_ITEM", "key={} | bodies={} | components={}".format(
+                key,
+                bodies_summary_for_debug(info.get("template_bodies", [])),
+                objects_summary_for_debug(info.get("template_components", []))
+            ))
+
+            for b in info.get("template_bodies", []):
+                add_body_unique_by_identity(b, template_bodies, template_body_keys)
+
+            for c in info.get("template_components", []):
+                add_unique_object(c, template_components, template_component_keys)
+
+            for b in info.get("template_bodies", []):
+                for c in get_template_body_parent_candidates(b):
+                    add_unique_object(c, template_components, template_component_keys)
+    except Exception as e:
+        append_full_txt_log_exception("TEMPLATE_CLEANUP_COLLECT_ERROR", e)
+
+    template_body_tokens = make_body_snapshot_token_dict_from_bodies(template_bodies)
+
+    summary["template_bodies"] = len(template_bodies)
+    summary["template_components"] = len(template_components)
+
+    if len(template_bodies) == 0:
+        print("Template cleanup: no template bodies found in cache.")
+        append_full_txt_log("TEMPLATE_CLEANUP_NO_BODIES", "No bodies in template cache")
+        return summary
+
+    print("")
+    print("Cleaning  database templates after replacement loop...")
+    print("Template cleanup action: {}".format(action))
+    print("Template bodies found: {}".format(len(template_bodies)))
+    print("Template component/container candidates: {}".format(len(template_components)))
+
+    append_full_txt_log("TEMPLATE_CLEANUP_COLLECTED", "bodies={} | components={}".format(
+        len(template_bodies),
+        len(template_components)
+    ))
+
+    if action == "HIDE":
+        for b in template_bodies:
+            if hide_item(b):
+                summary["body_hidden"] += 1
+                append_full_txt_log("TEMPLATE_HIDE_OK", body_summary_for_debug(b))
+            else:
+                summary["failed"] += 1
+                append_full_txt_log("TEMPLATE_HIDE_FAILED", body_summary_for_debug(b))
+        append_full_txt_log("TEMPLATE_CLEANUP_SUMMARY", safe_str(summary))
+        return summary
+
+    if action != "DELETE":
+        append_full_txt_log("TEMPLATE_CLEANUP_UNSUPPORTED_ACTION", action)
+        print("Template cleanup skipped: unsupported action '{}'".format(action))
+        return summary
+
+    handled_body_keys = {}
+
+    # 1) Prefer deleting component/container occurrences, not linked bodies.
+    if DELETE_TEMPLATE_COMPONENTS_WHEN_SAFE:
+        for c in template_components:
+            try:
+                safe, reason, comp_bodies = component_is_safe_template_container(c, template_body_keys, template_body_tokens)
+                append_full_txt_log(
+                    "TEMPLATE_COMPONENT_EVAL",
+                    "candidate={} | safe={} | reason={} | bodies={}".format(
+                        object_summary_for_debug(c),
+                        safe,
+                        reason,
+                        bodies_summary_for_debug(comp_bodies)
+                    )
+                )
+
+                if not safe:
+                    continue
+
+                summary["safe_component_candidates"] += 1
+                ok, err = try_direct_delete_object(c, "template_component")
+                if ok:
+                    summary["component_deleted"] += 1
+                    for b in comp_bodies:
+                        bkey = object_identity_key(b)
+                        if bkey != "":
+                            handled_body_keys[bkey] = True
+                else:
+                    summary["failed"] += 1
+            except Exception as e:
+                summary["failed"] += 1
+                append_full_txt_log_exception("TEMPLATE_COMPONENT_DELETE_LOOP_ERROR", e)
+
+    # 2) Remaining linked template bodies: do not delete directly unless explicitly enabled.
+    for b in template_bodies:
+        bkey = object_identity_key(b)
+        if bkey != "" and bkey in handled_body_keys:
+            continue
+
+        if TEMPLATE_DELETE_DIRECT_BODY_FALLBACK:
+            ok, err = try_direct_delete_object(b, "template_body_direct_fallback")
+            if ok:
+                summary["body_deleted"] += 1
+                continue
+            else:
+                summary["failed"] += 1
+
+        else:
+            summary["direct_body_delete_skipped"] += 1
+            append_full_txt_log(
+                "TEMPLATE_DIRECT_BODY_DELETE_SKIPPED",
+                "Direct body delete disabled to avoid SpaceClaim save prompt | body={}".format(body_summary_for_debug(b))
+            )
+
+        if TEMPLATE_HIDE_IF_DELETE_FAILS:
+            if hide_item(b):
+                summary["body_hidden"] += 1
+                append_full_txt_log("TEMPLATE_BODY_HIDE_FALLBACK_OK", body_summary_for_debug(b))
+            else:
+                summary["failed"] += 1
+                append_full_txt_log("TEMPLATE_BODY_HIDE_FALLBACK_FAILED", body_summary_for_debug(b))
+        else:
+            append_full_txt_log("TEMPLATE_BODY_LEFT_VISIBLE_AFTER_DELETE_SKIP", body_summary_for_debug(b))
+
+    print(
+        "Template cleanup finished: action={} | template_bodies={} | template_components={} | safe_components={} | component_deleted={} | body_deleted={} | body_hidden={} | direct_body_delete_skipped={} | failed={}".format(
+            summary["action"],
+            summary["template_bodies"],
+            summary["template_components"],
+            summary["safe_component_candidates"],
+            summary["component_deleted"],
+            summary["body_deleted"],
+            summary["body_hidden"],
+            summary["direct_body_delete_skipped"],
+            summary["failed"]
+        )
+    )
+
+    append_full_txt_log("TEMPLATE_CLEANUP_SUMMARY", safe_str(summary))
+    return summary
+
+
+def prepare_database_template_for_row(db_row, template_cache):
+
+    key = db_template_key(db_row)
+
+    if key in template_cache:
+        return template_cache[key]
+
+    db_file_path, path_source = resolve_database_item_file_path(db_row)
+    debug_event(
+        "TEMPLATE_IMPORT_START",
+        "TEMPLATE_" + key,
+        None,
+        {},
+        db_row,
+        None,
+        None,
+        "Importing database item as V10 template",
+        "db_file_path={} | source={}".format(db_file_path, path_source)
+    )
+
+    import_file_path = db_file_path
+    import_path_source = path_source
+
+    # Use a unique temp file only once for the template import, to avoid any
+    # accidental file/path cache during import.
+    if USE_UNIQUE_TEMP_IMPORT_COPY_PER_PLAN:
+        import_file_path, import_path_source = make_unique_temp_import_file(
+            db_file_path,
+            db_row,
+            "TEMPLATE_" + key
+        )
+
+    new_bodies, import_method = insert_database_file_into_current_document(import_file_path)
+    template_components = list(LAST_INSERT_CREATED_COMPONENTS)
+    cleanup_unique_temp_import_file(import_file_path, db_file_path)
+
+    if len(new_bodies) == 0:
+        raise Exception("V10 template import produced no bodies for database item: " + key)
+
+    replacement_body = choose_imported_treated_surface_body(new_bodies, db_row)
+    original_body = choose_imported_original_body(new_bodies, db_row)
+
+    if replacement_body is None:
+        raise Exception("V10 template import could not identify treated/replacement body for: " + key)
+
+    source_frame = None
+    source_frame_source = ""
+
+    if USE_DATABASE_ROW_FRAME_AS_SOURCE_FIRST:
+        source_frame = frame_from_database_row(db_row)
+        if source_frame is not None:
+            source_frame_source = "database_row_plane_frame"
+
+    if source_frame is None and original_body is not None:
+        source_frame = compute_ordered_reference_frame_from_body(original_body)
+        if source_frame is not None:
+            source_frame_source = "template_original_body_fallback"
+
+    if source_frame is None:
+        source_frame = compute_ordered_reference_frame_from_body(replacement_body)
+        if source_frame is not None:
+            source_frame_source = "template_replacement_body_fallback"
+
+    if source_frame is None:
+        raise Exception("V10 template source frame could not be created for: " + key)
+
+    template_info = {
+        "key": key,
+        "db_row": db_row,
+        "db_file_path": db_file_path,
+        "db_item_file_path_source": path_source,
+        "import_method": import_method,
+        "template_import_file_path": import_file_path,
+        "template_import_path_source": import_path_source,
+        "template_components": template_components,
+        "template_component_detail": LAST_INSERT_COMPONENT_DETAIL,
+        "template_bodies": list(new_bodies),
+        "template_replacement_body": replacement_body,
+        "template_original_body": original_body,
+        "source_frame": source_frame,
+        "source_frame_source": source_frame_source
+    }
+
+    debug_event(
+        "TEMPLATE_IMPORT_DONE",
+        "TEMPLATE_" + key,
+        None,
+        {},
+        db_row,
+        replacement_body,
+        source_frame,
+        "Database item template ready",
+        "method={} | bodies={} | components={} | component_detail={} | replacement={} | original={} | source_frame_source={} | import_file={}".format(
+            import_method,
+            len(new_bodies),
+            len(template_components),
+            LAST_INSERT_COMPONENT_DETAIL,
+            body_summary_for_debug(replacement_body),
+            body_summary_for_debug(original_body),
+            source_frame_source,
+            import_file_path
+        )
+    )
+
+    # Keep the template untouched. Hiding is okay because future copy/paste uses
+    # the object reference, but it is not transformed.
+    apply_template_body_action(new_bodies, key)
+
+    template_cache[key] = template_info
+    return template_info
+
+def copy_template_replacement_body(template_info, target_plan_id):
+    template_body = template_info.get("template_replacement_body")
+
+    if template_body is None:
+        return None, "template replacement body is None"
+
+    copied_body, copy_error = copy_body_in_place_as_independent(template_body)
+
+    if copied_body is None:
+        return None, copy_error
+
+    try:
+        set_name(copied_body, "{}_COPY_{}_{}".format(FINAL_REPLACEMENT_PREFIX, template_info.get("key", "DB"), target_plan_id))
+    except:
+        pass
+
+    return copied_body, ""
+
+def replace_one_target_body_from_template(target_body, target_sig, db_row, score, match_index, target_frame_snapshot, target_plan_id, template_cache, target_vertex_cloud_snapshot=None):
+
+    temp_planes = []
+
+    db_file_path, path_source = resolve_database_item_file_path(db_row)
+
+    log_row = {
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "target_body_name": target_sig.get("body_name"),
+        "target_action": "",
+        "accepted": 1,
+        "replaced": 0,
+        "score": score,
+        "db_file_key": db_row.get("file_key", ""),
+        "db_body_name": db_row.get("body_name", ""),
+        "db_pair_id": db_row.get("pair_id", ""),
+        "db_item_file_path": db_file_path,
+        "db_item_file_path_source": path_source,
+        "replacement_body_name": "",
+        "import_method": "V10_TEMPLATE_COPY",
+        "new_bodies_count": "",
+        "transformed_items_count": "",
+        "transform_delta_x_mm": "",
+        "transform_delta_y_mm": "",
+        "transform_delta_z_mm": "",
+        "transform_rotation_1_rad": "",
+        "transform_rotation_2_rad": "",
+        "target_plan_id": target_plan_id,
+        "target_center_x_mm": "",
+        "target_center_y_mm": "",
+        "target_center_z_mm": "",
+        "source_frame_source": "",
+        "source_original_body_name": "",
+        "target_axis_quality": "",
+        "target_ref_warning": "",
+        "orientation_signs": "",
+        "orientation_score_mean_mm": "",
+        "orientation_score_max_mm": "",
+        "orientation_warning": "",
+        "baked_copy_created": 1,
+        "baked_replacement_body_name": "",
+        "imported_set_after_bake_action": "TEMPLATE_REUSED_NOT_MOVED",
+        "individual_instance_mode": "V10_TEMPLATE_COPY_PER_OCCURRENCE",
+        "error_message": ""
+    }
+
+    try:
+        target_frame = clone_frame(target_frame_snapshot)
+
+        if target_frame is None:
+            # Last resort only. Normal V10 must use the frozen planned frame.
+            target_frame = compute_ordered_reference_frame_from_body(target_body)
+
+        if target_frame is None:
+            raise Exception("V10 could not obtain target frame for plan " + safe_str(target_plan_id))
+
+        c = target_frame.get("center")
+        if c is not None:
+            log_row["target_center_x_mm"] = c[0]
+            log_row["target_center_y_mm"] = c[1]
+            log_row["target_center_z_mm"] = c[2]
+
+        log_row["target_axis_quality"] = target_frame.get("axis_quality", "")
+        log_row["target_ref_warning"] = target_frame.get("warning", "")
+
+        debug_event(
+            "V10_REPLACE_START",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            target_body,
+            target_frame,
+            "Starting V10 template-copy replacement",
+            "target={} | db_key={} | score={}".format(
+                body_summary_for_debug(target_body),
+                db_template_key(db_row),
+                score
+            )
+        )
+
+        temp_planes = create_temporary_target_planes(target_body, target_frame, match_index)
+
+        if DRY_RUN:
+            log_row["target_action"] = "DRY_RUN"
+            append_log(log_row)
+            delete_temporary_planes(temp_planes)
+            return True
+
+        template_info = prepare_database_template_for_row(db_row, template_cache)
+        source_frame = clone_frame(template_info.get("source_frame"))
+
+        if source_frame is None:
+            raise Exception("V10 template has no source frame for db key " + db_template_key(db_row))
+
+        log_row["source_frame_source"] = template_info.get("source_frame_source", "")
+        try:
+            original_body = template_info.get("template_original_body")
+            log_row["source_original_body_name"] = get_name(original_body)
+        except:
+            pass
+
+        replacement_copy, copy_error = copy_template_replacement_body(template_info, target_plan_id)
+
+        if replacement_copy is None:
+            debug_event(
+                "V10_TEMPLATE_COPY_FAILED",
+                target_plan_id,
+                target_body,
+                target_sig,
+                db_row,
+                template_info.get("template_replacement_body"),
+                source_frame,
+                "Could not copy template replacement body",
+                copy_error
+            )
+            if ABORT_IF_TEMPLATE_COPY_FAILS:
+                raise Exception("V10 template replacement copy failed: " + safe_str(copy_error))
+            return False
+
+        debug_event(
+            "_COPY_READY",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            replacement_copy,
+            source_frame,
+            "Template copy created and ready for transform",
+            body_summary_for_debug(replacement_copy)
+        )
+
+        target_frame_for_alignment = target_frame
+
+        # Optional only. Default False because repeated target bodies may share master references.
+        if USE_VERTEX_CLOUD_ORIENTATION_IN_TEMPLATE_WORKFLOW:
+            orientation_source = "live_target_body"
+
+            if (
+                USE_PLANNED_TARGET_VERTEX_CLOUD_FOR_ORIENTATION and
+                target_vertex_cloud_snapshot is not None and
+                len(target_vertex_cloud_snapshot) > 0
+            ):
+                orientation_result = choose_best_target_frame_variant_by_planned_target_points(
+                    template_info.get("template_original_body"),
+                    target_vertex_cloud_snapshot,
+                    source_frame,
+                    target_frame
+                )
+                orientation_source = "planned_target_vertex_cloud"
+            else:
+                orientation_result = choose_best_target_frame_variant_by_vertex_cloud(
+                    template_info.get("template_original_body"),
+                    target_body,
+                    source_frame,
+                    target_frame
+                )
+
+            target_frame_for_alignment = orientation_result.get("frame", target_frame)
+            log_row["orientation_signs"] = orientation_result.get("signs", "")
+            log_row["orientation_score_mean_mm"] = orientation_result.get("mean_score", "")
+            log_row["orientation_score_max_mm"] = orientation_result.get("max_score", "")
+            log_row["orientation_warning"] = orientation_result.get("warning", "")
+
+            append_full_txt_log(
+                "V16_ORIENTATION_SOURCE",
+                "plan={} | target={} | db_key={} | source={} | target_vertices={} | signs={} | mean_score={} | max_score={} | warning={}".format(
+                    target_plan_id,
+                    target_sig.get("body_name"),
+                    safe_str(db_row.get("file_key", "DB")),
+                    orientation_source,
+                    len(target_vertex_cloud_snapshot) if target_vertex_cloud_snapshot is not None else 0,
+                    log_row["orientation_signs"],
+                    log_row["orientation_score_mean_mm"],
+                    log_row["orientation_score_max_mm"],
+                    log_row["orientation_warning"]
+                )
+            )
+        else:
+            log_row["orientation_signs"] = "frame_as_planned_no_vertex_cloud"
+
+        debug_event(
+            "TRANSFORM_BEFORE",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            replacement_copy,
+            source_frame,
+            "Before V10 transform of copied replacement only",
+            "source_frame={} | target_frame={}".format(frame_summary_for_debug(source_frame), frame_summary_for_debug(target_frame_for_alignment))
+        )
+
+        transform_result = align_items_to_target_frame(
+            [replacement_copy],
+            source_frame,
+            target_frame_for_alignment
+        )
+
+        log_row["transformed_items_count"] = transform_result.get("items_transformed", "")
+        log_row["transform_delta_x_mm"] = transform_result.get("delta_x_mm", "")
+        log_row["transform_delta_y_mm"] = transform_result.get("delta_y_mm", "")
+        log_row["transform_delta_z_mm"] = transform_result.get("delta_z_mm", "")
+        log_row["transform_rotation_1_rad"] = transform_result.get("rotation_1_rad", "")
+        log_row["transform_rotation_2_rad"] = transform_result.get("rotation_2_rad", "")
+
+        debug_event(
+            "TRANSFORM_AFTER",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            replacement_copy,
+            target_frame_for_alignment,
+            "After transform of copied replacement only",
+            "transform_result={} | replacement={}".format(safe_str(transform_result), body_summary_for_debug(replacement_copy))
+        )
+
+        if TAG_IMPORTED_REPLACEMENT_BODY:
+            target_instance_label = make_target_instance_label(target_sig, target_plan_id)
+            new_name = "{}_{}_AT_{}".format(
+                FINAL_REPLACEMENT_PREFIX.rstrip("_"),
+                make_safe_name(safe_str(db_row.get("file_key", "DB"))),
+                target_instance_label
+            )
+            set_name(replacement_copy, new_name)
+
+        log_row["replacement_body_name"] = get_name(replacement_copy)
+        log_row["baked_replacement_body_name"] = get_name(replacement_copy)
+
+        debug_event(
+            "FINAL_REPLACEMENT_READY",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            replacement_copy,
+            target_frame_for_alignment,
+            "Final replacement body ready before target action",
+            body_summary_for_debug(replacement_copy)
+        )
+
+        target_action = apply_original_after_replacement_action(target_body, db_row)
+        log_row["target_action"] = target_action
+
+        debug_event(
+            "TARGET_ACTION_DONE",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            replacement_copy,
+            None,
+            "Original target action applied",
+            "action={}".format(target_action)
+        )
+
+        log_row["replaced"] = 1
+        append_log(log_row)
+        delete_temporary_planes(temp_planes)
+
+        debug_event(
+            "REPLACE_SUCCESS",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            replacement_copy,
+            None,
+            "Replacement finished successfully",
+            ""
+        )
+
+        return True
+
+    except Exception as e:
+        log_row["error_message"] = safe_str(e)
+        append_log(log_row)
+        delete_temporary_planes(temp_planes)
+
+        debug_event(
+            "REPLACE_FAILED",
+            target_plan_id,
+            target_body,
+            target_sig,
+            db_row,
+            None,
+            None,
+            "Replacement failed",
+            safe_str(e)
+        )
+
+        print("Replacement failed for {}: {}".format(target_sig.get("body_name"), e))
+        return False
+
+def prepare_templates_for_plan(plan):
+    """
+    Preload one template per unique database item used in the frozen plan.
+    Planning is already complete at this point, so template bodies cannot pollute
+    match detection.
+    """
+    template_cache = {}
+    needed = []
+    used = {}
+
+    for item in plan:
+        db_row = item.get("db_row")
+        key = db_template_key(db_row)
+        if key not in used:
+            used[key] = True
+            needed.append(db_row)
+
+    print("")
+    print("Preparing V10 database templates: {} unique database item(s)".format(len(needed)))
+
+    for db_row in needed:
+        key = db_template_key(db_row)
+        print("  preparing template: {}".format(key))
+        prepare_database_template_for_row(db_row, template_cache)
+
+    return template_cache
+
+def locate_and_replace_dirty_instances():
+    init_full_txt_log()
+    append_full_txt_log("RUN_START", "Starting locate_and_replace_dirty_instances V19 second pass / ANSYS25 V251")
+
+    db_rows = read_database_original_solids()
+    append_full_txt_log("DATABASE_ROWS_LOADED", "count={}".format(len(db_rows)))
+    if len(db_rows) == 0:
+        print("No original_solid rows found in database.")
+        append_full_txt_log("RUN_ABORT", "No original_solid rows found in database")
+        return
+
+    init_log()
+    init_diagnostic_logs()
+
+    # Snapshot before importing any replacement file.
+    bodies = get_all_bodies()
+
+    print("")
+    print("Starting locate and replace V19 - second pass / ANSYS 25 V251")
+    print("Assembly bodies snapshot: {}".format(len(bodies)))
+    print("Database rows: {}".format(len(db_rows)))
+    print("")
+
+    plan, processed, accepted_count, rejected_count, skipped_count = build_replacement_plan_from_initial_snapshot(
+        bodies,
+        db_rows
+    )
+
+    print_plan_summary(plan)
+
+    template_cache = {}
+    if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW and len(plan) > 0:
+        template_cache = prepare_templates_for_plan(plan)
+
+    replaced_count = 0
+    failed_count = 0
+    match_index = 0
+
+    for item in plan:
+        if MAX_REPLACEMENTS > 0 and replaced_count >= MAX_REPLACEMENTS:
+            break
+
+        match_index += 1
+
+        body = item.get("body")
+        target_sig = item.get("target_sig")
+        db_row = item.get("db_row")
+        score = item.get("score")
+        target_frame_snapshot = item.get("target_frame")
+        target_vertex_cloud_snapshot = item.get("target_vertex_cloud", [])
+        target_plan_id = item.get("plan_id", "")
+
+        print("")
+        print("REPLACING PLANNED MATCH {}/{}".format(match_index, len(plan)))
+        print("Plan ID: {}".format(target_plan_id))
+        print("Target: {}".format(target_sig.get("body_name")))
+        print("DB key: {}".format(db_row.get("file_key")))
+
+        if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW:
+            ok = replace_one_target_body_from_template(
+                body,
+                target_sig,
+                db_row,
+                score,
+                match_index,
+                target_frame_snapshot,
+                target_plan_id,
+                template_cache,
+                target_vertex_cloud_snapshot
+            )
+        else:
+            ok = replace_one_target_body(body, target_sig, db_row, score, match_index, target_frame_snapshot, target_plan_id)
+
+        if ok:
+            replaced_count += 1
+        else:
+            failed_count += 1
+
+    template_cleanup_summary = {}
+    if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW:
+        template_cleanup_summary = cleanup_database_templates_after_workflow(template_cache)
+
+    # ============================================================
+    # Second planning/replacement pass
+    # ============================================================
+    # Why:
+    # Some valid repeated instances can be skipped in pass 1 because they live
+    # under a component path/name that also appears in the database/template.
+    # Pass 2 runs only after template cleanup and relaxes only those two skip
+    # rules. The geometric matcher and existing-replacement guard still decide
+    # whether a body is actually replaced.
+    second_pass_processed = 0
+    second_pass_accepted = 0
+    second_pass_rejected = 0
+    second_pass_skipped = 0
+    second_pass_replaced = 0
+    second_pass_failed = 0
+    second_template_cleanup_summary = {}
+
+    if ENABLE_SECOND_REPLACEMENT_SCAN:
+        try:
+            append_full_txt_log(
+                "SECOND_PASS_START",
+                "rescan after first pass | current_replaced={} | allow_db_path={} | allow_db_name={}".format(
+                    replaced_count,
+                    SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS,
+                    SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS
+                )
+            )
+
+            global CURRENT_SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS
+            global CURRENT_SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS
+            CURRENT_SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS = SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS
+            CURRENT_SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS = SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS
+
+            second_bodies = get_all_bodies()
+            second_plan, second_pass_processed, second_pass_accepted, second_pass_rejected, second_pass_skipped = build_replacement_plan_from_initial_snapshot(
+                second_bodies,
+                db_rows
+            )
+
+            CURRENT_SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS = False
+            CURRENT_SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS = False
+
+            append_full_txt_log(
+                "SECOND_PASS_PLAN_DONE",
+                "bodies={} | processed={} | accepted={} | rejected={} | skipped={}".format(
+                    len(second_bodies),
+                    second_pass_processed,
+                    second_pass_accepted,
+                    second_pass_rejected,
+                    second_pass_skipped
+                )
+            )
+
+            second_template_cache = {}
+            if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW and len(second_plan) > 0:
+                second_template_cache = prepare_templates_for_plan(second_plan)
+
+            second_match_index = 0
+            for second_item in second_plan:
+                if MAX_REPLACEMENTS > 0 and replaced_count >= MAX_REPLACEMENTS:
+                    break
+
+                second_match_index += 1
+                match_index += 1
+
+                body = second_item.get("body")
+                target_sig = second_item.get("target_sig")
+                db_row = second_item.get("db_row")
+                score = second_item.get("score")
+                target_frame_snapshot = second_item.get("target_frame")
+                target_vertex_cloud_snapshot = second_item.get("target_vertex_cloud", [])
+                target_plan_id = "PASS2_" + second_item.get("plan_id", "")
+
+                print("")
+                print("REPLACING SECOND-PASS MATCH {}/{}".format(second_match_index, len(second_plan)))
+                print("Plan ID: {}".format(target_plan_id))
+                print("Target: {}".format(target_sig.get("body_name")))
+                print("DB key: {}".format(db_row.get("file_key")))
+
+                if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW:
+                    ok = replace_one_target_body_from_template(
+                        body,
+                        target_sig,
+                        db_row,
+                        score,
+                        match_index,
+                        target_frame_snapshot,
+                        target_plan_id,
+                        second_template_cache,
+                        target_vertex_cloud_snapshot
+                    )
+                else:
+                    ok = replace_one_target_body(body, target_sig, db_row, score, match_index, target_frame_snapshot, target_plan_id)
+
+                if ok:
+                    replaced_count += 1
+                    second_pass_replaced += 1
+                else:
+                    failed_count += 1
+                    second_pass_failed += 1
+
+            if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW:
+                second_template_cleanup_summary = cleanup_database_templates_after_workflow(second_template_cache)
+
+            append_full_txt_log(
+                "SECOND_PASS_DONE",
+                "accepted={} | replaced={} | failed={}".format(
+                    second_pass_accepted,
+                    second_pass_replaced,
+                    second_pass_failed
+                )
+            )
+
+            processed += second_pass_processed
+            accepted_count += second_pass_accepted
+            rejected_count += second_pass_rejected
+            skipped_count += second_pass_skipped
+
+        except Exception as e:
+            CURRENT_SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS = False
+            CURRENT_SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS = False
+            append_full_txt_log_exception("SECOND_PASS_EXCEPTION", e)
+            print("Second pass failed: {}".format(e))
+
+    msg = ""
+    msg += "Locate and replace finished.\n\n"
+    msg += "Database rows: {}\n".format(len(db_rows))
+    msg += "Bodies in initial snapshot: {}\n".format(len(bodies))
+    msg += "Processed candidates: {}\n".format(processed)
+    msg += "Matches accepted/planned: {}\n".format(accepted_count)
+    msg += "Replacements completed: {}\n".format(replaced_count)
+    msg += "Replacement failures: {}\n".format(failed_count)
+    if ENABLE_SECOND_REPLACEMENT_SCAN:
+        msg += "Second pass accepted/planned: {}\n".format(second_pass_accepted)
+        msg += "Second pass replacements completed: {}\n".format(second_pass_replaced)
+        msg += "Second pass replacement failures: {}\n".format(second_pass_failed)
+    if USE_TEMPLATE_COPY_PER_OCCURRENCE_WORKFLOW:
+        msg += "Template cleanup action: {}\n".format(template_cleanup_summary.get("action", ""))
+        msg += "Template bodies found: {}\n".format(template_cleanup_summary.get("template_bodies", 0))
+        msg += "Template component candidates: {}\n".format(template_cleanup_summary.get("template_components", 0))
+        msg += "Safe template components: {}\n".format(template_cleanup_summary.get("safe_component_candidates", 0))
+        msg += "Template components deleted: {}\n".format(template_cleanup_summary.get("component_deleted", 0))
+        msg += "Template body direct deletes: {}\n".format(template_cleanup_summary.get("body_deleted", 0))
+        msg += "Template body hidden fallback: {}\n".format(template_cleanup_summary.get("body_hidden", 0))
+        msg += "Template direct body delete skipped: {}\n".format(template_cleanup_summary.get("direct_body_delete_skipped", 0))
+        msg += "Template cleanup failures: {}\n".format(template_cleanup_summary.get("failed", 0))
+    msg += "Rejected candidates: {}\n".format(rejected_count)
+    msg += "Skipped bodies: {}\n".format(skipped_count)
+    msg += "Log:\n{}\n".format(REPLACEMENT_LOG_CSV)
+    if ENABLE_FULL_TXT_LOG:
+        msg += "Full TXT debug log:\n{}\n".format(FULL_TXT_LOG_PATH)
+    if ENABLE_DIAGNOSTIC_LOGS:
+        msg += "Diagnostic event log:\n{}\n".format(DIAGNOSTIC_EVENT_LOG_CSV)
+        msg += "Diagnostic plan log:\n{}".format(DIAGNOSTIC_PLAN_LOG_CSV)
+
+    append_full_txt_log("RUN_SUMMARY", msg.replace("\n", " | "))
+
+    print("")
+    print(msg)
+
+    try:
+        MessageBox.Show(msg)
+    except:
+        pass
+
+# ============================================================
+# RUN
+# ============================================================
+
+locate_and_replace_dirty_instances()
