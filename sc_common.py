@@ -48,7 +48,7 @@ def find_unconnected_edge(grupo_arestas, aresta_inicial):
 
         return None  # nenhuma aresta não conectada foi encontrada
     except Exception as e:
-        print("Erro ao buscar aresta não conectada: {}".format(e))
+        print("Erro ao buscar aresta não conectada: {e}")
         return None
 
 # Função para medir distância entre vértices
@@ -200,7 +200,7 @@ def create_loft_from_pasted_edges(pastedResult1, pastedResult2):
         
         return resultBody
     except Exception as e:
-        print("Ocorreu um erro: {}".format(e))
+        print("Ocorreu um erro: " .format(e))
         return None
 
 # Função para combinar dois corpos
@@ -252,7 +252,7 @@ def copy_and_paste_edges(selection):
 
         return result #pastedSelection
     except Exception as e:
-        print("Ocorreu um erro: {}".format(e))
+        print("Ocorreu um erro: " .format(e))
         return None
 
 # Fatiar corpos por plano 
@@ -573,7 +573,7 @@ def sort_by_vertex_share(edges):
             print("Aviso: As arestas não formam um loop fechado.")
         return ordered_edges
     except Exception as e:
-        print("Erro: {}".format(e))
+        print("Erro: {str(e)}")
         return None
     
 # Função para medir distancia minima entre duas faces
@@ -595,15 +595,32 @@ def get_face_normal_safe(face):
     Retorna normal de uma DesignFace de forma compatível com execução
     interna no SpaceClaim e também via módulo importado.
 
-    Ordem:
-    1) face.GetFaceNormal(0,0), quando disponível;
-    2) face.Shape.Geometry.Frame.DirZ, para faces planas;
-    3) face.Shape.Geometry.Frame.Axis, fallback;
+    Ordem (revisada para suportar NurbsSurface / tubos):
+    1) face.EvalMid().Normal - método universal que funciona para qualquer
+       tipo de superfície (Plane, Cylinder, NurbsSurface, etc.);
+    2) face.GetFaceNormal(0,0), quando disponível;
+    3) face.Shape.Geometry.Frame.DirZ, para faces planas;
+    4) face.Shape.Geometry.Frame.Axis, fallback para Plane;
+    5) face.Shape.Geometry.Evaluate(centro_param).Normal, fallback paramétrico
+       para NurbsSurface e outras superfícies sem Frame;
+    6) Propriedades diretas geom.Normal / geom.Direction.
     """
     if face is None:
         return None
 
-    # Forma original usada quando o script roda direto no SpaceClaim
+    # 1) EvalMid() - método universal e robusto.
+    #    Funciona para Plane, Cylinder, NurbsSurface, Sphere, Torus, etc.
+    #    Resolve o caso do tubo (NurbsSurface) que quebrava todos os fallbacks.
+    try:
+        ev = face.EvalMid()
+        if ev is not None:
+            normal = ev.Normal
+            if normal is not None:
+                return normal
+    except:
+        pass
+
+    # 2) Forma original usada quando o script roda direto no SpaceClaim
     try:
         return face.GetFaceNormal(0, 0)
         
@@ -611,7 +628,7 @@ def get_face_normal_safe(face):
         
         pass
 
-    # Fallback para execução como módulo importado
+    # 3) Fallback para faces planas: Frame.DirZ / Frame.Axis
     try:
         geom = face.Shape.Geometry
         frame = geom.Frame
@@ -628,7 +645,24 @@ def get_face_normal_safe(face):
     except:
         pass
 
-    # Último fallback: tenta propriedades diretas da geometria
+    # 4) Fallback paramétrico via Evaluate no centro do ParameterBox.
+    #    Cobre NurbsSurface e outras superfícies que não expõem Frame.
+    try:
+        geom = face.Shape.Geometry
+        try:
+            pbox = face.Shape.GetParameterBox()
+            center_param = pbox.Center
+            eval_result = geom.Evaluate(center_param)
+            if eval_result is not None:
+                normal = eval_result.Normal
+                if normal is not None:
+                    return normal
+        except:
+            pass
+    except:
+        pass
+
+    # 5) Último fallback: tenta propriedades diretas da geometria
     try:
         geom = face.Shape.Geometry
         try:
@@ -759,7 +793,7 @@ def split_faces(face1, face2):
 
     except Exception as e:
         print("oi")
-        print("Ocorreu um erro ao dividir as faces: {}".format(e))
+        print("Ocorreu um erro ao dividir as faces: ".format(e))
         try:
             return list(result.CreatedFaces)
         except:
@@ -786,7 +820,7 @@ def extract_last_face(body):
         return out_face1, out_face2
 
     except Exception as e:
-        print("Erro inesperado: {}".format(e))
+        print("Erro inesperado: ".format(e))
         return None, None
     
 # Função para encontrar face mais próxima ou mais distante centro de duas faces em relação a outra
