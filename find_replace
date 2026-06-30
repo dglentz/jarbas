@@ -1,6 +1,5 @@
 # Python Script, API Version = V251
 # -*- coding: utf-8 -*-
-# find_replace_bank_v19_second_pass_ansys25_v251.py
 
 import csv
 import os
@@ -8,7 +7,6 @@ import shutil
 import math
 import traceback
 from datetime import datetime
-
 
 # ============================================================
 # CONFIG
@@ -34,7 +32,6 @@ DEBUG_LOG_SKIPPED_CANDIDATES = False
 DEBUG_LOG_IMPORT_BODY_DETAILS = False
 DEBUG_LOG_TRANSFORM_DETAILS = False
 DEBUG_MAX_DETAIL_TEXT_LENGTH = 32000
-
 
 # Matching database rows.
 DATABASE_ROLE_TO_MATCH = "original_solid"
@@ -101,7 +98,6 @@ USE_PLANNED_TARGET_VERTEX_CLOUD_FOR_ORIENTATION = True
 SKIP_TARGETS_WITH_EXISTING_REPLACEMENT_AT_SAME_CENTER = True
 
 # Imported file normally contains original solid + treated midsurface.
-# V3 rule: DO NOT delete the imported dirty/source solid during the loop.
 # In SpaceClaim, inserted files can behave as dependent component definitions.
 # Deleting the imported original in the first replacement may remove it from later imports,
 # causing wrong positioning because the source frame is no longer available.
@@ -162,7 +158,7 @@ COPY_RESULT_USES_SNAPSHOT_TOKENS = True
 # IMPORTANT: do not rename/delete the linked template bodies directly by default.
 # In SpaceClaim, directly editing/deleting a DesignBody that came from an inserted
 # .scdocx can mark the inserted item as modified and trigger the prompt:
-# "Save changes to the following item(s)?". V14 first tries to delete the inserted
+# "Save changes to the following item(s)?". 
 # component/container occurrence. If that is not found, it now keeps the template visible
 # and writes a full txt diagnostic log, so we do not mask a failed deletion as hide.
 CLEANUP_DATABASE_TEMPLATES_AFTER_REPLACEMENT = True
@@ -174,7 +170,7 @@ TEMPLATE_HIDE_IF_DELETE_FAILS = False
 TEMPLATE_COMPONENT_SAFETY_USES_BODY_SNAPSHOT_TOKENS = True
 
 # Some plates/brackets have ambiguous PCA axes. Sign flip is not enough;
-# X/Y/Z order can also be swapped. V12 tests all right-handed axis
+# X/Y/Z order can also be swapped.
 # permutations of the target frame using the dirty solid vertex cloud and
 # selects the variant with the lowest source-to-target vertex distance.
 USE_VERTEX_CLOUD_AXIS_PERMUTATION_RESOLUTION = True
@@ -190,10 +186,6 @@ SKIP_DATABASE_COMPONENT_PATH_MATCHES = True
 DATABASE_FILE_KEYS = {}
 DATABASE_BODY_NAMES = {}
 
-# First pass preserves the original V17 behavior. After template cleanup, a second
-# planning/replacement pass can rescan the assembly and allow bodies that were
-# skipped in pass 1 only because their component path or name matched the database.
-# The existing-replacement guard still prevents duplicates.
 ENABLE_SECOND_REPLACEMENT_SCAN = True
 SECOND_PASS_ALLOW_DATABASE_COMPONENT_PATH_TARGETS = True
 SECOND_PASS_ALLOW_DATABASE_BODY_NAME_TARGETS = True
@@ -222,14 +214,12 @@ BAKE_POSITIONED_REPLACEMENT_COPY = False
 # Options: "DELETE", "HIDE", "KEEP".
 # DELETE is recommended here because the final replacement is the baked independent copy.
 IMPORTED_SET_AFTER_BAKE_ACTION = "DELETE"
-
-# If the independent copy fails, keep the V4 fallback behavior instead of failing the whole run.
 FALLBACK_TO_LINKED_REPLACEMENT_IF_BAKE_FAILS = True
 
 # Tag names for audit.
 # Avoid renaming repeated/instanced target masters during validation.
 # Renaming the target polluted names in the diagnostic:
-# REPLACED_BY_DB_...REPLACED_BY_DB_...75
+
 TAG_TARGET_ORIGINAL_BODY = False
 TAG_IMPORTED_REPLACEMENT_BODY = True
 
@@ -408,7 +398,7 @@ def init_full_txt_log():
     try:
         ensure_folder_for_file(FULL_TXT_LOG_PATH)
         with open(FULL_TXT_LOG_PATH, "w") as f:
-            f.write("find_replace V17 full debug log\n")
+            f.write("find_replace full debug log\n")
             f.write("started_at={}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             f.write("database_index={}\n".format(DATABASE_INDEX_CSV))
             f.write("database_folder={}\n".format(DATABASE_ITEM_FOLDER))
@@ -901,7 +891,6 @@ def passes_aabb_gate(target, db):
 
 def topology_integer_signature_matches(target, db):
     """
-    V17 helper.
     Checks the stable topological counters exactly. This is deliberately stricter
     than the normal topology gate because it is used only to bypass AABB failures.
     """
@@ -921,7 +910,6 @@ def topology_integer_signature_matches(target, db):
             return False
         if t != d:
             return False
-
     return True
 
 def passes_mass_topology_aabb_fallback(target, db, metrics=None):
@@ -1578,7 +1566,6 @@ def body_in_list(body, bodies):
 # ============================================================
 # IMPORT SNAPSHOT ISOLATION
 # ============================================================
-#
 
 def round_key_value(value, ndigits):
     try:
